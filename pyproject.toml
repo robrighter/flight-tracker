@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=59.6"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flight-tracker"
+version = "0.1.0"
+description = "CLI that finds the nearest aircraft to your current location."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Rob Righter" }]
+dependencies = []
+
+[project.scripts]
+flight-tracker = "flight_tracker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
