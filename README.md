@@ -1,8 +1,8 @@
 # Flight Tracker
 
-Flight Tracker is a small Python app that finds the aircraft closest to you and explains what it knows about that plane in plain English.
+Flight Tracker is a small app that finds the aircraft closest to you and explains what it knows about that plane in plain English.
 
-It can run as a terminal CLI or as a lightweight desktop UI. The app estimates your location, searches nearby live aircraft positions, picks the closest aircraft, enriches it with public aircraft/route/registry data, and shows distance, heading, altitude, speed, nearest city, operator, and route when available.
+The current distributable is a Rust CLI that compiles into a clean Windows executable. The original Python CLI/Tkinter implementation remains in `src/flight_tracker` for reference. The app estimates your location, searches nearby live aircraft positions, picks the closest aircraft, enriches it with public aircraft/route/registry data, and shows distance, heading, altitude, speed, nearest city, operator, and route when available.
 
 ## What It Shows
 
@@ -24,7 +24,7 @@ The app is intentionally honest about uncertainty. Public ADS-B state vectors do
 
 Flight Tracker uses public web APIs and registries:
 
-- **ipapi**: estimates your current location from your public IP address when `--lat` and `--lon` are not provided.
+- **Windows Location API**: estimates your current PC location when `--lat` and `--lon` are not provided.
 - **OpenSky Network**: provides live aircraft state vectors used to find nearby aircraft.
 - **OpenStreetMap Nominatim**: reverse-geocodes the aircraft coordinates into a nearby city/place.
 - **ADSBDB**: enriches aircraft and route data by ICAO24/callsign when available.
@@ -32,7 +32,112 @@ Flight Tracker uses public web APIs and registries:
 
 OpenSky's anonymous API is rate limited. You can optionally provide OpenSky OAuth credentials for a higher quota.
 
-## Install
+## Build The Windows EXE
+
+Build a native Windows ARM64 executable:
+
+```powershell
+$env:CARGO_INCREMENTAL="0"
+$env:CARGO_TARGET_DIR="$env:USERPROFILE\.codex\build\flight-tracker-target"
+cargo build --release --target aarch64-pc-windows-msvc
+```
+
+The checked build artifact is copied to:
+
+```text
+dist/windows-arm64/flight-tracker.exe
+```
+
+If building directly from this WSL-mounted path, keep `CARGO_TARGET_DIR` on a normal Windows filesystem. Cargo incremental build locks can fail on `\\wsl.localhost` paths.
+
+## Rust CLI Usage
+
+Find the closest aircraft using the Windows PC location API:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe
+```
+
+Use exact coordinates instead of Windows location:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --lat 40.7128 --lon -74.0060
+```
+
+If Windows cannot determine your location, save a fallback location in settings:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --set-location --lat 40.7128 --lon -74.0060 --location-label "Home"
+```
+
+View or clear that saved fallback:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --show-settings
+.\dist\windows-arm64\flight-tracker.exe --clear-location
+```
+
+Search a wider area:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --radius-km 300
+```
+
+The search radius must be greater than `0` and no more than `1000` km.
+
+Use imperial or metric distance units:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --units imperial
+.\dist\windows-arm64\flight-tracker.exe --units metric
+```
+
+Imperial is the default.
+
+Print structured JSON instead of the human-readable report:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --json
+```
+
+Show help:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --help
+```
+
+## Rust Desktop Dashboard
+
+Launch the native ops-board dashboard window:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --ui
+```
+
+The dashboard is a single-instrument operations board inspired by mid-century
+airport ops rooms (see `mockups/aviation-ui-ops-board.png`). It shows:
+
+- A **NEAREST** flight-strip board listing the closest aircraft (up to five) with
+  summary, operator, route, and motion columns. Click a row to focus it.
+- A **radar scope** that plots all listed contacts by bearing and distance, with
+  the focused aircraft highlighted and called out. The scope auto-scales to the
+  farthest contact shown.
+- **Detail panels** for the focused aircraft: summary, operator, route, registry,
+  motion, and update time.
+- A header with **OVERVIEW / RAW REPORT** tabs, an **NM / KM** units toggle, the
+  last update time, and a **REFRESH** button that re-queries live traffic.
+
+The window works with the same location options as the CLI, e.g. explicit
+coordinates and a wider search radius:
+
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --ui --lat 40.7128 --lon -74.0060 --radius-km 200
+```
+
+Only the focused aircraft is enriched with route/registry/operator detail (to
+respect upstream rate limits); selecting another row enriches it on demand.
+
+## Python Reference Install
 
 From the project directory:
 
@@ -46,7 +151,7 @@ You can also run directly without installing:
 PYTHONPATH=src python3 -m flight_tracker
 ```
 
-## CLI Usage
+## Python CLI Usage
 
 Find the closest aircraft using IP-based location:
 
@@ -89,7 +194,7 @@ Show help:
 flight-tracker --help
 ```
 
-## Desktop UI
+## Python Desktop UI
 
 Launch the optional desktop UI:
 
@@ -135,23 +240,31 @@ The credentials are read from environment variables and sent only to OpenSky's t
 
 This app calls third-party services.
 
-If you do not provide `--lat` and `--lon`, it sends a request to ipapi so your public IP address can be used to estimate your location. It sends the search bounding box to OpenSky, aircraft coordinates to Nominatim, aircraft identifiers/callsigns to ADSBDB, and U.S. N-numbers to the FAA registry when applicable.
+The Rust executable uses the Windows Location API when `--lat` and `--lon` are not provided. If Windows cannot determine your location, save a fallback location with `--set-location`. It sends the search bounding box to OpenSky, aircraft coordinates to Nominatim, aircraft identifiers/callsigns to ADSBDB, and U.S. N-numbers to the FAA registry when applicable.
 
-Use explicit coordinates if you do not want IP-based geolocation:
+Use explicit coordinates if you do not want to use Windows Location Services:
 
-```bash
-flight-tracker --lat 40.7128 --lon -74.0060
+```powershell
+.\dist\windows-arm64\flight-tracker.exe --lat 40.7128 --lon -74.0060
 ```
 
 ## Security Notes
 
-The app does not use `eval`, shell execution, subprocess calls, or unsafe deserialization. It uses only the Python standard library at runtime.
+The Rust executable does not use `eval`, shell execution, subprocess calls, or unsafe deserialization.
 
 HTTP responses are size-limited to reduce memory-exhaustion risk, and upstream display text is sanitized to remove control characters before it is shown in the terminal or UI.
 
 ## Development
 
 Run tests:
+
+```powershell
+$env:CARGO_INCREMENTAL="0"
+$env:CARGO_TARGET_DIR="$env:USERPROFILE\.codex\build\flight-tracker-target"
+cargo test
+```
+
+Run Python reference tests:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
@@ -176,4 +289,3 @@ PYTHONPATH=src python3 -m flight_tracker --help
 - FAA registry lookups apply only to U.S. aircraft.
 - Military identification is based on known callsign patterns and may be incomplete.
 - API availability and rate limits can affect results.
-

@@ -6,6 +6,7 @@ __pycache__/
 # Build and packaging artifacts
 build/
 dist/
+target/
 *.egg-info/
 *.egg
 
@@ -39,4 +40,3 @@ htmlcov/
 *.swo
 .DS_Store
 Thumbs.db
-
