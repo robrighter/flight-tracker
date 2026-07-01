@@ -10,36 +10,40 @@ use std::fmt::{self, Display};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::OnceLock;
 #[cfg(windows)]
 use std::sync::Mutex;
+use std::sync::OnceLock;
+#[cfg(windows)]
+use std::thread;
 use std::time::Duration;
 #[cfg(windows)]
 use windows::Devices::Geolocation::{Geolocator, PositionAccuracy};
 #[cfg(windows)]
 use windows::Foundation::TimeSpan;
 #[cfg(windows)]
+use windows::Win32::Foundation::POINT;
+#[cfg(windows)]
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DeleteDC, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK, DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_BOLD,
-    FW_NORMAL, FillRect, HDC, HGDIOBJ, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, PS_SOLID, Polygon, RoundRect, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT, UpdateWindow,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
+    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC,
+    DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_BOLD, FW_NORMAL, FillRect, HDC,
+    HGDIOBJ, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, Polygon,
+    RGBQUAD, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
+    UpdateWindow,
 };
-#[cfg(windows)]
-use windows::Win32::Foundation::POINT;
 #[cfg(windows)]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetClientRect, GetMessageW, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassW,
-    SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_PAINT, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW,
+    KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_MINIMIZE, SW_SHOW, SetTimer,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_POPUP, WS_VISIBLE,
 };
 #[cfg(windows)]
 use windows::core::{PCWSTR, w};
@@ -65,6 +69,24 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 #[cfg(windows)]
 static UI_STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
 const UI_LIST_LIMIT: usize = 5;
+#[cfg(windows)]
+const DESIGN_WIDTH: i32 = 1672;
+#[cfg(windows)]
+const DESIGN_HEIGHT: i32 = 941;
+#[cfg(windows)]
+const WINDOW_WIDTH: i32 = 1170;
+#[cfg(windows)]
+const WINDOW_HEIGHT: i32 = 659;
+#[cfg(windows)]
+const AUTO_REFRESH_TIMER_ID: usize = 1;
+#[cfg(windows)]
+const AUTO_REFRESH_INTERVAL_MS: u32 = 20_000;
+#[cfg(windows)]
+const ASSET_BACKGROUND_PNG: &[u8] = include_bytes!("../assets/ui/mock-texture-background-70.png");
+#[cfg(windows)]
+const ASSET_SELECTED_ROW: &[u8] = include_bytes!("../assets/ui/selected-row-underlay-70.bmp");
+#[cfg(windows)]
+const ASSET_RAW_REPORT: &[u8] = include_bytes!("../assets/ui/raw-report-70.bmp");
 
 const STATE_FIELDS: [&str; 17] = [
     "icao24",
@@ -144,11 +166,7 @@ struct Cli {
     clear_location: bool,
     #[arg(long, help = "Launch the native desktop dashboard window.")]
     ui: bool,
-    #[arg(
-        long,
-        default_value_t = 60,
-        help = "Desktop UI refresh interval hint (manual refresh button for now)."
-    )]
+    #[arg(long, default_value_t = 60, help = "Desktop UI refresh interval hint.")]
     refresh_seconds: u64,
     #[arg(long, value_enum, default_value_t = Units::Imperial)]
     units: Units,
@@ -243,6 +261,7 @@ struct JsonOutput {
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 struct UiModel {
+    callsign: String,
     operator: String,
     route_detail: String,
     summary: String,
@@ -292,14 +311,21 @@ impl UiModel {
             .api_time
             .map(|timestamp| format_timestamp(Some(timestamp)))
             .unwrap_or_else(|| "unknown".to_string());
+        let callsign = state
+            .callsign
+            .clone()
+            .map(|callsign| callsign.trim().to_string())
+            .filter(|callsign| !callsign.is_empty())
+            .unwrap_or_else(|| "NO CALLSIGN".to_string());
         // `units` currently affects distance/summary phrasing only; motion is
         // shown in standard aviation units (knots, flight level) like the mock.
         let _ = units;
 
         Self {
+            callsign,
             operator,
             route_detail,
-            summary: human_summary(nearest, units),
+            summary: ui_summary_card(nearest, units),
             altitude: ui_flight_level(state.baro_altitude),
             speed: ui_speed(state.velocity),
             heading: ui_heading(state.true_track),
@@ -317,6 +343,7 @@ impl UiModel {
     }
 }
 
+#[derive(Clone)]
 struct ApiClient {
     client: Client,
 }
@@ -399,7 +426,9 @@ struct UiState {
     enriched: Vec<bool>,
     selected: usize,
     report: String,
+    raw_scroll_lines: usize,
     status: String,
+    refreshing: bool,
 }
 
 impl UiState {
@@ -410,6 +439,7 @@ impl UiState {
         units: Units,
         aircraft: Vec<NearestAircraft>,
     ) -> Self {
+        let has_aircraft = !aircraft.is_empty();
         let enriched = vec![false; aircraft.len()];
         let mut state = Self {
             client,
@@ -421,11 +451,14 @@ impl UiState {
             enriched,
             selected: 0,
             report: String::new(),
-            status: "LIVE ADS-B".to_string(),
+            raw_scroll_lines: 0,
+            status: if has_aircraft {
+                "LIVE ADS-B".to_string()
+            } else {
+                "WAITING FOR ADS-B".to_string()
+            },
+            refreshing: false,
         };
-        if !state.aircraft.is_empty() {
-            state.enrich_selected();
-        }
         state.rebuild_report();
         state
     }
@@ -450,25 +483,25 @@ impl UiState {
         }
     }
 
-    fn select(&mut self, index: usize) {
+    fn select(&mut self, index: usize) -> bool {
         if index >= self.aircraft.len() || index == self.selected {
-            return;
+            return false;
         }
         self.selected = index;
-        self.enrich_selected();
+        self.raw_scroll_lines = 0;
         self.rebuild_report();
+        true
     }
 
     fn set_units(&mut self, units: Units) {
         self.units = units;
+        self.raw_scroll_lines = 0;
         self.rebuild_report();
     }
 
     fn rebuild_report(&mut self) {
         self.report = match self.selected_aircraft() {
-            Some(aircraft) => {
-                build_report(&self.location, aircraft, self.radius_km, self.units)
-            }
+            Some(aircraft) => build_report(&self.location, aircraft, self.radius_km, self.units),
             None => "No aircraft in range.".to_string(),
         };
     }
@@ -533,7 +566,7 @@ fn run() -> AppResult<()> {
         }
         let client = ApiClient::new(args.timeout)?;
         let location = resolve_location(&args, &client)?;
-        let aircraft = find_nearby_aircraft(&location, args.radius_km, &client, UI_LIST_LIMIT)?;
+        let aircraft = Vec::new();
         let state = UiState::new(client, location, args.radius_km, args.units, aircraft);
         return run_dashboard_window(state);
     }
@@ -692,13 +725,15 @@ fn settings_path() -> AppResult<PathBuf> {
 /// hit-testing code never drift apart.
 #[cfg(windows)]
 struct Layout {
+    width: i32,
+    height: i32,
     overview_tab: RECT,
     raw_tab: RECT,
     nm_btn: RECT,
     km_btn: RECT,
-    refresh_btn: RECT,
+    minimize_btn: RECT,
+    close_btn: RECT,
     main: RECT,
-    board: RECT,
     radar: RECT,
     bottom: RECT,
     board_clip: RECT,
@@ -708,39 +743,53 @@ struct Layout {
 
 #[cfg(windows)]
 impl Layout {
+    fn sx(&self, value: i32) -> i32 {
+        scale_x(self.width, value)
+    }
+
+    fn sy(&self, value: i32) -> i32 {
+        scale_y(self.height, value)
+    }
+
+    fn font(&self, size: i32) -> i32 {
+        scale_font(self.width, size)
+    }
+
     fn row_rect(&self, index: usize) -> RECT {
         let top = self.row_y + self.row_h * index as i32;
-        rect_xy(self.board_clip.left, top, self.board_clip.right, top + self.row_h)
+        rect_xy(
+            self.board_clip.left,
+            top,
+            self.board_clip.right,
+            top + self.row_h,
+        )
     }
 }
 
 #[cfg(windows)]
 fn compute_layout(width: i32, height: i32) -> Layout {
-    let top_h = 72;
-    let gutter = 14;
-    let main_top = top_h + 10;
-    let bottom_h = 180;
-    let main_bottom = height - bottom_h - 12;
-    let left_w = ((width as f32) * 0.55) as i32;
+    let sx = |value: i32| scale_x(width, value);
+    let sy = |value: i32| scale_y(height, value);
 
-    let board = rect_xy(gutter, main_top, left_w, main_bottom);
-    let board_clip = inset(board, 16, 14);
-    let header_y = board_clip.top + 58;
-    let row_y = header_y + 34;
+    let board_clip = rect_xy(sx(32), sy(134), sx(910), sy(648));
+    let header_y = board_clip.top + sy(58);
+    let row_y = header_y + sy(34);
 
     Layout {
-        overview_tab: rect_xy(width / 2 - 200, 13, width / 2 - 60, 59),
-        raw_tab: rect_xy(width / 2 - 55, 13, width / 2 + 85, 59),
-        nm_btn: rect_xy(width - 470, 18, width - 420, 54),
-        km_btn: rect_xy(width - 414, 18, width - 364, 54),
-        refresh_btn: rect_xy(width - 150, 15, width - 20, 57),
-        main: rect_xy(gutter, main_top, width - gutter, main_bottom),
-        board,
-        radar: rect_xy(left_w + 10, main_top, width - gutter, main_bottom),
-        bottom: rect_xy(gutter, main_bottom + 12, width - gutter, height - 14),
+        width,
+        height,
+        overview_tab: rect_xy(sx(553), sy(15), sx(738), sy(64)),
+        raw_tab: rect_xy(sx(739), sy(15), sx(938), sy(64)),
+        nm_btn: rect_xy(sx(1084), sy(16), sx(1162), sy(63)),
+        km_btn: rect_xy(sx(1163), sy(16), sx(1236), sy(63)),
+        minimize_btn: rect_xy(sx(1510), sy(20), sx(1576), sy(58)),
+        close_btn: rect_xy(sx(1584), sy(20), sx(1648), sy(58)),
+        main: rect_xy(sx(14), sy(78), sx(1659), sy(868)),
+        radar: rect_xy(sx(933), sy(78), sx(1660), sy(674)),
+        bottom: rect_xy(sx(14), sy(686), sx(1659), sy(868)),
         board_clip,
         row_y,
-        row_h: 82,
+        row_h: sy(84).max(1),
     }
 }
 
@@ -775,15 +824,17 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
         RegisterClassW(&window_class);
 
         let title = to_wide("Flight Tracker");
+        let window_style = WS_POPUP | WS_VISIBLE;
+        let window_ex_style = WINDOW_EX_STYLE(0);
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            window_ex_style,
             class_name,
             PCWSTR(title.as_ptr()),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            window_style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1160,
-            860,
+            WINDOW_WIDTH,
+            WINDOW_HEIGHT,
             None,
             None,
             Some(instance),
@@ -791,7 +842,20 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
         )
         .map_err(|error| FlightTrackerError(format!("could not create window: {error}")))?;
 
+        let timer_id = SetTimer(
+            Some(hwnd),
+            AUTO_REFRESH_TIMER_ID,
+            AUTO_REFRESH_INTERVAL_MS,
+            None,
+        );
+        if timer_id == 0 {
+            return Err(FlightTrackerError(
+                "could not start dashboard refresh timer".to_string(),
+            ));
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+        refresh_dashboard(hwnd, true);
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).into() {
@@ -829,18 +893,57 @@ extern "system" fn dashboard_window_proc(
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
+            WM_NCHITTEST => hit_test_frameless_window(hwnd, lparam),
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 handle_click(hwnd, x, y);
                 LRESULT(0)
             }
+            WM_MOUSEWHEEL => {
+                handle_mouse_wheel(hwnd, wparam);
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                if wparam.0 == AUTO_REFRESH_TIMER_ID {
+                    refresh_dashboard(hwnd, false);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                }
+            }
             WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), AUTO_REFRESH_TIMER_ID);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
+    }
+}
+
+#[cfg(windows)]
+fn hit_test_frameless_window(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    let mut window = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
+        return unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, WPARAM(0), lparam) };
+    }
+    let x = screen_x - window.left;
+    let y = screen_y - window.top;
+    let layout = compute_layout(WINDOW_WIDTH, WINDOW_HEIGHT);
+    let over_control = point_in(layout.overview_tab, x, y)
+        || point_in(layout.raw_tab, x, y)
+        || point_in(layout.nm_btn, x, y)
+        || point_in(layout.km_btn, x, y)
+        || point_in(layout.minimize_btn, x, y)
+        || point_in(layout.close_btn, x, y);
+
+    if y < scale_y(WINDOW_HEIGHT, 74) && !over_control {
+        LRESULT(HTCAPTION as isize)
+    } else {
+        LRESULT(HTCLIENT as isize)
     }
 }
 
@@ -859,27 +962,36 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
     if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
         return;
     }
-    let width = (client.right - client.left).max(1040);
-    let height = (client.bottom - client.top).max(720);
+    let width = (client.right - client.left).max(1);
+    let height = (client.bottom - client.top).max(1);
     let layout = compute_layout(width, height);
 
+    if point_in(layout.close_btn, x, y) {
+        let _ = unsafe { DestroyWindow(hwnd) };
+        return;
+    } else if point_in(layout.minimize_btn, x, y) {
+        let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+        return;
+    }
+
     let mut changed = true;
-    let mut needs_blocking_refresh = false;
+    let mut enrich_index = None;
     if point_in(layout.overview_tab, x, y) {
         state.tab = Tab::Overview;
     } else if point_in(layout.raw_tab, x, y) {
         state.tab = Tab::RawReport;
+        state.raw_scroll_lines = 0;
     } else if point_in(layout.nm_btn, x, y) {
         state.set_units(Units::Imperial);
     } else if point_in(layout.km_btn, x, y) {
         state.set_units(Units::Metric);
-    } else if point_in(layout.refresh_btn, x, y) {
-        needs_blocking_refresh = true;
     } else if state.tab == Tab::Overview {
         let mut hit = false;
         for index in 0..state.aircraft.len().min(UI_LIST_LIMIT) {
             if point_in(layout.row_rect(index), x, y) {
-                state.select(index);
+                if state.select(index) {
+                    enrich_index = Some(index);
+                }
                 hit = true;
                 break;
             }
@@ -889,7 +1001,7 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
         changed = false;
     }
 
-    if needs_blocking_refresh {
+    if false {
         // Show a "refreshing" status immediately, then perform the blocking
         // network call and repaint with the fresh contacts.
         state.status = "REFRESHING…".to_string();
@@ -907,6 +1019,167 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
     if changed {
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
+    if let Some(index) = enrich_index {
+        enrich_selected_async(hwnd, index);
+    }
+}
+
+#[cfg(windows)]
+fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM) {
+    let Some(state_mutex) = UI_STATE.get() else {
+        return;
+    };
+    let Ok(mut state) = state_mutex.lock() else {
+        return;
+    };
+    if state.tab != Tab::RawReport {
+        return;
+    }
+
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+        return;
+    }
+    let width = (client.right - client.left).max(1);
+    let height = (client.bottom - client.top).max(1);
+    let layout = compute_layout(width, height);
+    let max_scroll = raw_report_max_scroll_lines(&layout, &state.report);
+    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    let notches = (delta.abs() / 120).max(1) as usize;
+    let step = notches * 3;
+    let current = state.raw_scroll_lines;
+    state.raw_scroll_lines = if delta > 0 {
+        state.raw_scroll_lines.saturating_sub(step)
+    } else {
+        (state.raw_scroll_lines + step).min(max_scroll)
+    };
+    let changed = state.raw_scroll_lines != current;
+    drop(state);
+    if changed {
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+}
+
+#[cfg(windows)]
+fn enrich_selected_async(hwnd: HWND, index: usize) {
+    let Some(state_mutex) = UI_STATE.get() else {
+        return;
+    };
+    let (client, mut aircraft, icao24) = {
+        let Ok(mut state) = state_mutex.lock() else {
+            return;
+        };
+        if state.enriched.get(index).copied().unwrap_or(true) {
+            return;
+        }
+        let Some(aircraft) = state.aircraft.get(index).cloned() else {
+            return;
+        };
+        state.status = "LOOKING UP DETAILS".to_string();
+        (
+            state.client.clone(),
+            aircraft.clone(),
+            aircraft.state.icao24,
+        )
+    };
+
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    let hwnd_value = hwnd.0 as isize;
+    thread::spawn(move || {
+        enrich_aircraft(&mut aircraft, &client);
+        if let Some(state_mutex) = UI_STATE.get() {
+            if let Ok(mut state) = state_mutex.lock() {
+                let same_aircraft = state
+                    .aircraft
+                    .get(index)
+                    .map(|current| current.state.icao24 == icao24)
+                    .unwrap_or(false);
+                if same_aircraft {
+                    state.aircraft[index] = aircraft;
+                    if let Some(enriched) = state.enriched.get_mut(index) {
+                        *enriched = true;
+                    }
+                    if state.selected == index {
+                        state.status = "LIVE ADS-B".to_string();
+                        state.rebuild_report();
+                    }
+                }
+            }
+        }
+        let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    });
+}
+
+#[cfg(windows)]
+fn refresh_dashboard(hwnd: HWND, show_status: bool) {
+    let Some(state_mutex) = UI_STATE.get() else {
+        return;
+    };
+    let (client, location, radius_km) = {
+        let Ok(mut state) = state_mutex.lock() else {
+            return;
+        };
+        if state.refreshing {
+            return;
+        }
+        state.refreshing = true;
+        if show_status {
+            state.status = "REFRESHING".to_string();
+        }
+        (
+            state.client.clone(),
+            state.location.clone(),
+            state.radius_km,
+        )
+    };
+
+    if show_status {
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        let _ = unsafe { UpdateWindow(hwnd) };
+    }
+
+    let hwnd_value = hwnd.0 as isize;
+    thread::spawn(move || {
+        let result = match find_nearby_aircraft(&location, radius_km, &client, UI_LIST_LIMIT) {
+            Ok(mut aircraft) if !aircraft.is_empty() => {
+                let mut enriched = vec![false; aircraft.len()];
+                for aircraft in &mut aircraft {
+                    enrich_aircraft_table_details(aircraft, &client);
+                }
+                if let Some(selected) = aircraft.get_mut(0) {
+                    enrich_aircraft(selected, &client);
+                    enriched[0] = true;
+                }
+                Ok(Some((aircraft, enriched)))
+            }
+            Ok(_) => Ok(None),
+            Err(error) => Err(error),
+        };
+        if let Some(state_mutex) = UI_STATE.get() {
+            if let Ok(mut state) = state_mutex.lock() {
+                match result {
+                    Ok(Some((aircraft, enriched))) => {
+                        state.aircraft = aircraft;
+                        state.enriched = enriched;
+                        state.selected = 0;
+                        state.raw_scroll_lines = 0;
+                        state.status = "LIVE ADS-B".to_string();
+                        state.rebuild_report();
+                    }
+                    Ok(None) => {
+                        state.status = "NO CONTACTS".to_string();
+                    }
+                    Err(error) => {
+                        state.status = format!("REFRESH FAILED: {error}");
+                    }
+                }
+                state.refreshing = false;
+            }
+        }
+        let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    });
 }
 
 #[cfg(windows)]
@@ -941,58 +1214,131 @@ fn paint_dashboard(hwnd: HWND) {
 fn draw_dashboard(hdc: HDC, rect: RECT, state: &UiState) {
     unsafe {
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let width = (rect.right - rect.left).max(1040);
-        let height = (rect.bottom - rect.top).max(720);
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
         let layout = compute_layout(width, height);
-        fill_rect(hdc, rect_xy(0, 0, width, height), rgb(12, 24, 33));
+        let shell = rect_xy(0, 0, width, height);
+        fill_rect(hdc, shell, rgb(8, 18, 27));
+        draw_png_background_1x(hdc);
+        draw_tab_state(hdc, &layout, state.tab);
 
         let model = state
             .selected_aircraft()
             .map(|aircraft| UiModel::from_flight(&state.location, aircraft, state.units));
 
-        let top_h = 72;
-        fill_rect(hdc, rect_xy(0, 0, width, top_h), rgb(15, 27, 37));
-        fill_rect(hdc, rect_xy(0, top_h - 3, width, top_h), rgb(153, 111, 44));
-        draw_text(
-            hdc,
-            "\u{2708}  FLIGHT TRACKER",
-            rect_xy(34, 16, 360, 58),
-            28,
-            true,
-            rgb(239, 225, 195),
-            Align::Left,
-        );
-        draw_segment(hdc, "OVERVIEW", layout.overview_tab, state.tab == Tab::Overview);
-        draw_segment(hdc, "RAW REPORT", layout.raw_tab, state.tab == Tab::RawReport);
-        draw_segment(hdc, "NM", layout.nm_btn, matches!(state.units, Units::Imperial));
-        draw_segment(hdc, "KM", layout.km_btn, matches!(state.units, Units::Metric));
-
         let updated = match &model {
-            Some(model) => format!("UPDATED  {}", compact_time(&model.updated)),
+            Some(model) => compact_time(&model.updated),
             None => state.status.clone(),
         };
         draw_text(
             hdc,
             &updated,
-            rect_xy(width - 352, 18, layout.refresh_btn.left - 14, 54),
-            18,
+            scale_rect(width, height, 1362, 18, 1498, 54),
+            scale_font(width, 18),
             true,
             rgb(240, 226, 196),
-            Align::Right,
+            Align::Left,
         );
-        draw_button(hdc, "\u{21bb} REFRESH", layout.refresh_btn);
 
         match state.tab {
             Tab::Overview => {
                 draw_board(hdc, &layout, state);
-                draw_radar(hdc, layout.radar, state);
-                draw_bottom_panels(hdc, layout.bottom, model.as_ref(), &state.status);
+                draw_radar(hdc, &layout, state);
+                draw_bottom_panels(hdc, &layout, model.as_ref(), &state.status);
             }
             Tab::RawReport => {
-                draw_raw_report(hdc, layout.main, &state.report);
+                draw_raw_report(hdc, &layout, &state.report, state.raw_scroll_lines);
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn draw_tab_state(hdc: HDC, layout: &Layout, active: Tab) {
+    draw_tab(
+        hdc,
+        layout,
+        layout.overview_tab,
+        "OVERVIEW",
+        active == Tab::Overview,
+    );
+    draw_tab(
+        hdc,
+        layout,
+        layout.raw_tab,
+        "RAW REPORT",
+        active == Tab::RawReport,
+    );
+}
+
+#[cfg(windows)]
+fn draw_tab(hdc: HDC, layout: &Layout, rect: RECT, label: &str, active: bool) {
+    let fill = if active {
+        rgb(126, 18, 16)
+    } else {
+        rgb(8, 21, 31)
+    };
+    let top = if active {
+        rgb(184, 42, 33)
+    } else {
+        rgb(30, 55, 70)
+    };
+    let bottom = if active {
+        rgb(62, 12, 12)
+    } else {
+        rgb(2, 8, 13)
+    };
+    let border = rgb(82, 96, 102);
+    fill_rect(hdc, rect, fill);
+    draw_line(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.top,
+        top,
+        scale_len(layout.width, 2),
+    );
+    draw_line(
+        hdc,
+        rect.left,
+        rect.bottom - 1,
+        rect.right,
+        rect.bottom - 1,
+        bottom,
+        scale_len(layout.width, 2),
+    );
+    draw_line(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.left,
+        rect.bottom,
+        border,
+        scale_len(layout.width, 1),
+    );
+    draw_line(
+        hdc,
+        rect.right - 1,
+        rect.top,
+        rect.right - 1,
+        rect.bottom,
+        border,
+        scale_len(layout.width, 1),
+    );
+    draw_text(
+        hdc,
+        label,
+        inset(rect, layout.sx(12), layout.sy(8)),
+        layout.font(19),
+        true,
+        if active {
+            rgb(246, 228, 199)
+        } else {
+            rgb(184, 181, 170)
+        },
+        Align::Center,
+    );
 }
 
 /// One contact rendered into the NEAREST flight-strip board.
@@ -1002,8 +1348,10 @@ struct RowView {
     sub: String,
     operator: String,
     route: String,
-    motion_top: String,
-    motion_bot: String,
+    motion_heading: String,
+    motion_speed: String,
+    motion_track: Option<f64>,
+    motion_altitude: String,
 }
 
 #[cfg(windows)]
@@ -1033,101 +1381,71 @@ fn row_view(aircraft: &NearestAircraft, units: Units) -> RowView {
         ),
         operator,
         route,
-        motion_top: format!(
-            "{}  {}",
-            ui_heading(state.true_track),
-            ui_speed(state.velocity)
-        ),
-        motion_bot: ui_flight_level(state.baro_altitude),
+        motion_heading: ui_heading(state.true_track),
+        motion_speed: ui_speed(state.velocity),
+        motion_track: state.true_track,
+        motion_altitude: ui_flight_level(state.baro_altitude),
     }
 }
 
 #[cfg(windows)]
-fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
-    let area = layout.board;
-    draw_panel(hdc, area, rgb(228, 211, 176), rgb(97, 69, 39));
-    let clip = layout.board_clip;
-    draw_text(
-        hdc,
-        "NEAREST",
-        rect_xy(clip.left, clip.top, clip.right, clip.top + 38),
-        24,
-        true,
-        rgb(139, 26, 22),
-        Align::Center,
-    );
-    draw_line(
-        hdc,
-        clip.left,
-        clip.top + 43,
-        clip.right,
-        clip.top + 43,
-        rgb(151, 114, 61),
-        1,
-    );
+fn ui_summary_card(nearest: &NearestAircraft, units: Units) -> String {
+    let callsign = nearest
+        .state
+        .callsign
+        .as_deref()
+        .map(str::trim)
+        .filter(|callsign| !callsign.is_empty())
+        .unwrap_or("This aircraft");
+    format!(
+        "{callsign} is nearest aircraft.\n{} away {}.\nAltitude {}.\nSpeed {}.",
+        ui_distance(nearest.distance_km, units),
+        compass16(nearest.bearing_degrees),
+        ui_flight_level(nearest.state.baro_altitude),
+        ui_speed(nearest.state.velocity),
+    )
+}
 
-    let header_y = clip.top + 58;
+#[cfg(windows)]
+fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
+    let clip = layout.board_clip;
+    let sx = |value: i32| layout.sx(value);
+    let sy = |value: i32| layout.sy(value);
+    let font = |size: i32| layout.font(size);
+    let header_y = clip.top + sy(58);
     // Columns are proportional to the (narrow) board width so the OPERATOR /
     // ROUTE / MOTION headers never collide regardless of window size.
     let w = clip.right - clip.left;
     let col = [
-        clip.left + 72,
+        clip.left + sx(72),
         clip.left + w * 34 / 100,
         clip.left + w * 57 / 100,
         clip.left + w * 77 / 100,
     ];
-    for (label, x) in [
-        ("SUMMARY", col[0]),
-        ("OPERATOR", col[1]),
-        ("ROUTE", col[2]),
-        ("MOTION", col[3]),
-    ] {
-        draw_text(
-            hdc,
-            label,
-            rect_xy(x, header_y, x + 140, header_y + 24),
-            14,
-            true,
-            rgb(30, 35, 35),
-            Align::Left,
-        );
-    }
-
     let row_h = layout.row_h;
     let count = state.aircraft.len().min(UI_LIST_LIMIT);
     for idx in 0..UI_LIST_LIMIT {
         let row = layout.row_rect(idx);
         let selected = idx == state.selected && idx < count;
-        let fill = if selected {
-            rgb(239, 220, 185)
-        } else if idx % 2 == 0 {
-            rgb(234, 216, 182)
-        } else {
-            rgb(226, 207, 172)
-        };
-        fill_rect(hdc, row, fill);
+        if selected {
+            draw_bmp_stretched(hdc, row, ASSET_SELECTED_ROW);
+        }
 
         if idx >= count {
             continue;
         }
         let view = row_view(&state.aircraft[idx], state.units);
 
-        // Oxblood selection rail with a marker arrow, matching the mock's
-        // highlighted flight strip.
-        if selected {
-            fill_rect(
+        if !selected {
+            fill_ellipse(
                 hdc,
-                rect_xy(row.left, row.top, row.left + 48, row.bottom),
-                rgb(127, 22, 20),
-            );
-            draw_text(
-                hdc,
-                "\u{25B6}",
-                rect_xy(row.left + 14, row.top + 28, row.left + 40, row.top + 56),
-                18,
-                true,
-                rgb(238, 225, 195),
-                Align::Center,
+                row.left + sx(14),
+                row.top + row_h / 2 - sy(5),
+                row.left + sx(24),
+                row.top + row_h / 2 + sy(5),
+                rgb(44, 53, 54),
+                rgb(229, 210, 174),
+                scale_len(layout.width, 1),
             );
         }
 
@@ -1135,8 +1453,13 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.callsign,
-            rect_xy(clip.left + 72, row.top + 14, col[1] - 10, row.top + 45),
-            22,
+            rect_xy(
+                clip.left + sx(72),
+                row.top + sy(14),
+                col[1] - sx(10),
+                row.top + sy(45),
+            ),
+            font(22),
             true,
             text_dark,
             Align::Left,
@@ -1144,8 +1467,13 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.sub,
-            rect_xy(clip.left + 72, row.top + 46, col[1] - 12, row.top + 70),
-            14,
+            rect_xy(
+                clip.left + sx(72),
+                row.top + sy(46),
+                col[1] - sx(12),
+                row.top + sy(70),
+            ),
+            font(14),
             true,
             rgb(141, 26, 22),
             Align::Left,
@@ -1153,8 +1481,8 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.operator,
-            rect_xy(col[1], row.top + 24, col[2] - 12, row.top + 58),
-            18,
+            rect_xy(col[1], row.top + sy(12), col[2] - sx(18), row.top + sy(72)),
+            font(15),
             false,
             text_dark,
             Align::Left,
@@ -1162,110 +1490,124 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.route,
-            rect_xy(col[2], row.top + 24, col[3] - 12, row.top + 58),
-            18,
+            rect_xy(col[2], row.top + sy(12), col[3] - sx(18), row.top + sy(72)),
+            font(15),
             true,
             text_dark,
             Align::Left,
         );
         draw_text(
             hdc,
-            &view.motion_top,
-            rect_xy(col[3], row.top + 16, clip.right - 16, row.top + 44),
-            16,
+            &view.motion_heading,
+            rect_xy(col[3], row.top + sy(16), col[3] + sx(62), row.top + sy(44)),
+            font(16),
             true,
             text_dark,
             Align::Left,
         );
         draw_text(
             hdc,
-            &view.motion_bot,
-            rect_xy(col[3], row.top + 46, clip.right - 16, row.top + 70),
-            15,
+            &view.motion_speed,
+            rect_xy(
+                col[3] + sx(70),
+                row.top + sy(16),
+                clip.right - sx(40),
+                row.top + sy(44),
+            ),
+            font(16),
+            true,
+            text_dark,
+            Align::Left,
+        );
+        draw_heading_arrow(
+            hdc,
+            rect_xy(
+                col[3] + sx(4),
+                row.top + sy(42),
+                col[3] + sx(36),
+                row.top + sy(72),
+            ),
+            view.motion_track,
+            text_dark,
+            layout.width,
+        );
+        draw_text(
+            hdc,
+            &view.motion_altitude,
+            rect_xy(
+                col[3] + sx(42),
+                row.top + sy(46),
+                clip.right - sx(40),
+                row.top + sy(72),
+            ),
+            font(15),
             false,
             rgb(80, 60, 40),
             Align::Left,
         );
-    }
-
-    for x in [col[1] - 18, col[2] - 14, col[3] - 16] {
-        draw_line(hdc, x, header_y + 6, x, clip.bottom - 12, rgb(185, 145, 83), 1);
-    }
-    for idx in 0..=UI_LIST_LIMIT {
-        let y = layout.row_y + row_h * idx as i32;
-        draw_line(hdc, clip.left, y, clip.right, y, rgb(183, 141, 82), 1);
-    }
-}
-
-#[cfg(windows)]
-fn draw_radar(hdc: HDC, area: RECT, state: &UiState) {
-    draw_panel(hdc, area, rgb(44, 47, 45), rgb(108, 91, 66));
-    let size = (area.right - area.left).min(area.bottom - area.top) - 54;
-    let cx = (area.left + area.right) / 2;
-    let cy = (area.top + area.bottom) / 2;
-    let radius = size / 2;
-    fill_ellipse(
-        hdc,
-        cx - radius,
-        cy - radius,
-        cx + radius,
-        cy + radius,
-        rgb(9, 39, 55),
-        rgb(185, 155, 93),
-        5,
-    );
-    fill_ellipse(
-        hdc,
-        cx - radius + 18,
-        cy - radius + 18,
-        cx + radius - 18,
-        cy + radius - 18,
-        rgb(10, 48, 68),
-        rgb(88, 104, 102),
-        1,
-    );
-
-    for ring in [1, 2, 3] {
-        let r = radius * ring / 4;
-        ellipse_outline(hdc, cx - r, cy - r, cx + r, cy + r, rgb(100, 128, 126), 1);
-    }
-    draw_line(
-        hdc,
-        cx - radius + 24,
-        cy,
-        cx + radius - 24,
-        cy,
-        rgb(100, 128, 126),
-        1,
-    );
-    draw_line(
-        hdc,
-        cx,
-        cy - radius + 24,
-        cx,
-        cy + radius - 24,
-        rgb(100, 128, 126),
-        1,
-    );
-    for (label, x, y) in [
-        ("N", cx - 12, cy - radius + 12),
-        ("E", cx + radius - 34, cy - 12),
-        ("S", cx - 10, cy + radius - 40),
-        ("W", cx - radius + 16, cy - 12),
-    ] {
         draw_text(
             hdc,
-            label,
-            rect_xy(x, y, x + 32, y + 34),
-            28,
+            ">",
+            rect_xy(
+                clip.right - sx(36),
+                row.top + sy(22),
+                clip.right - sx(12),
+                row.top + sy(58),
+            ),
+            font(30),
             true,
-            rgb(236, 211, 161),
+            rgb(18, 26, 29),
             Align::Center,
         );
     }
 
+    for x in [col[1] - sx(18), col[2] - sx(14), col[3] - sx(16)] {
+        draw_line(
+            hdc,
+            x,
+            header_y + sy(6),
+            x,
+            clip.bottom - sy(12),
+            rgb(185, 145, 83),
+            scale_len(layout.width, 1),
+        );
+    }
+    for idx in 0..=UI_LIST_LIMIT {
+        let y = layout.row_y + row_h * idx as i32;
+        draw_line(
+            hdc,
+            clip.left,
+            y,
+            clip.right,
+            y,
+            rgb(183, 141, 82),
+            scale_len(layout.width, 1),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
+    let area = layout.radar;
+    let sx = |value: i32| layout.sx(value);
+    let sy = |value: i32| layout.sy(value);
+    let font = |size: i32| layout.font(size);
+    let width = area.right - area.left;
+    let height = area.bottom - area.top;
+    let cx = area.left + width * 46 / 100;
+    let cy = area.top + height * 53 / 100;
+    let radius = width.min(height) * 47 / 100;
     // Centre marker for the observer's own position.
-    fill_ellipse(hdc, cx - 4, cy - 4, cx + 4, cy + 4, rgb(236, 211, 161), rgb(236, 211, 161), 1);
+    fill_ellipse(
+        hdc,
+        cx - sx(4),
+        cy - sy(4),
+        cx + sx(4),
+        cy + sy(4),
+        rgb(236, 211, 161),
+        rgb(236, 211, 161),
+        scale_len(layout.width, 1),
+    );
 
     let usable = (radius as f64) * 0.86;
     // Scale the scope to the farthest displayed contact (not the whole search
@@ -1291,7 +1633,7 @@ fn draw_radar(hdc: HDC, area: RECT, state: &UiState) {
             hdc,
             bx,
             by,
-            8,
+            sx(8),
             aircraft.state.true_track,
             rgb(120, 196, 224),
             rgb(40, 92, 112),
@@ -1300,18 +1642,35 @@ fn draw_radar(hdc: HDC, area: RECT, state: &UiState) {
 
     if let Some(aircraft) = state.aircraft.get(state.selected) {
         let (tx, ty) = radar_point(cx, cy, usable, span, aircraft);
-        draw_line(hdc, cx, cy, tx, ty, rgb(240, 190, 36), 2);
+        draw_line(
+            hdc,
+            cx,
+            cy,
+            tx,
+            ty,
+            rgb(240, 190, 36),
+            scale_len(layout.width, 2),
+        );
+        draw_target_brackets(hdc, tx, ty, sx(23), rgb(240, 190, 36), layout.width);
         fill_ellipse(
             hdc,
-            tx - 16,
-            ty - 16,
-            tx + 16,
-            ty + 16,
+            tx - sx(16),
+            ty - sy(16),
+            tx + sx(16),
+            ty + sy(16),
             rgb(99, 35, 26),
             rgb(240, 190, 36),
-            2,
+            scale_len(layout.width, 2),
         );
-        draw_plane_marker(hdc, tx, ty, 9, aircraft.state.true_track, rgb(255, 225, 138), rgb(120, 70, 20));
+        draw_plane_marker(
+            hdc,
+            tx,
+            ty,
+            sx(9),
+            aircraft.state.true_track,
+            rgb(255, 225, 138),
+            rgb(120, 70, 20),
+        );
         let callsign = aircraft
             .state
             .callsign
@@ -1328,8 +1687,8 @@ fn draw_radar(hdc: HDC, area: RECT, state: &UiState) {
                 compass16(aircraft.bearing_degrees),
                 ui_flight_level(aircraft.state.baro_altitude)
             ),
-            rect_xy(tx + 22, ty - 14, tx + 168, ty + 70),
-            15,
+            rect_xy(tx + sx(22), ty - sy(14), tx + sx(168), ty + sy(70)),
+            font(15),
             true,
             rgb(242, 218, 171),
             Align::Left,
@@ -1340,12 +1699,12 @@ fn draw_radar(hdc: HDC, area: RECT, state: &UiState) {
         hdc,
         &state.status,
         rect_xy(
-            area.left + 24,
-            area.bottom - 46,
-            area.right - 28,
-            area.bottom - 20,
+            area.left + sx(24),
+            area.bottom - sy(46),
+            area.right - sx(28),
+            area.bottom - sy(20),
         ),
-        15,
+        font(15),
         true,
         rgb(126, 220, 118),
         Align::Right,
@@ -1354,124 +1713,164 @@ fn draw_radar(hdc: HDC, area: RECT, state: &UiState) {
 
 /// Project an aircraft's bearing/distance onto the radar scope (North up).
 #[cfg(windows)]
-fn radar_point(cx: i32, cy: i32, usable: f64, span_km: f64, aircraft: &NearestAircraft) -> (i32, i32) {
+fn radar_point(
+    cx: i32,
+    cy: i32,
+    usable: f64,
+    span_km: f64,
+    aircraft: &NearestAircraft,
+) -> (i32, i32) {
     let r = usable * (aircraft.distance_km / span_km).clamp(0.0, 1.0);
     let angle = (aircraft.bearing_degrees - 90.0).to_radians();
-    (
-        cx + (angle.cos() * r) as i32,
-        cy + (angle.sin() * r) as i32,
-    )
+    (cx + (angle.cos() * r) as i32, cy + (angle.sin() * r) as i32)
 }
 
 #[cfg(windows)]
-fn draw_bottom_panels(hdc: HDC, area: RECT, model: Option<&UiModel>, status: &str) {
-    let gap = 8;
-    let total_w = area.right - area.left;
+fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status: &str) {
+    let area = layout.bottom;
     let Some(model) = model else {
         let panel = rect_xy(area.left, area.top, area.right, area.bottom);
-        draw_panel(hdc, panel, rgb(226, 207, 174), rgb(99, 72, 43));
         draw_text(
             hdc,
             status,
-            inset(panel, 20, 16),
-            18,
+            inset(panel, layout.sx(30), layout.sy(54)),
+            layout.font(18),
             true,
             rgb(113, 25, 23),
             Align::Left,
         );
         return;
     };
-    let widths = [
-        total_w * 24 / 100,
-        total_w * 15 / 100,
-        total_w * 15 / 100,
-        total_w * 13 / 100,
-        total_w * 18 / 100,
-        total_w * 15 / 100,
-    ];
-    let mut x = area.left;
-    let registry_body = format!("{}\n{}", model.registry, model.aircraft_type);
-    let motion_body = format!(
-        "HDG {}\nSPD {}\nALT {}\nSQK {}",
-        model.heading, model.speed, model.altitude, model.squawk
+    draw_text(
+        hdc,
+        &model.summary,
+        scale_rect(layout.width, layout.height, 162, 736, 386, 844),
+        layout.font(16),
+        false,
+        rgb(22, 33, 38),
+        Align::Left,
     );
-    let updated_body = format!(
-        "{}\n{}\n{}",
-        compact_time(&model.updated),
-        model.location,
-        model.position
+    draw_text(
+        hdc,
+        &model.operator,
+        scale_rect(layout.width, layout.height, 438, 738, 604, 786),
+        layout.font(21),
+        true,
+        rgb(22, 33, 38),
+        Align::Left,
     );
-    let panels = [
-        ("SUMMARY", model.summary.as_str()),
-        ("OPERATOR", model.operator.as_str()),
-        ("ROUTE", model.route_detail.as_str()),
-        ("REGISTRY", registry_body.as_str()),
-        ("MOTION", motion_body.as_str()),
-        ("UPDATED", updated_body.as_str()),
-    ];
-    for (idx, (title, body)) in panels.iter().enumerate() {
-        let right = if idx == panels.len() - 1 {
-            area.right
-        } else {
-            x + widths[idx]
-        };
-        let panel = rect_xy(x, area.top, right - gap, area.bottom);
-        draw_panel(hdc, panel, rgb(226, 207, 174), rgb(99, 72, 43));
+    draw_text(
+        hdc,
+        &model.callsign,
+        scale_rect(layout.width, layout.height, 438, 818, 604, 850),
+        layout.font(18),
+        true,
+        rgb(113, 25, 23),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &model.route_detail,
+        scale_rect(layout.width, layout.height, 658, 738, 850, 848),
+        layout.font(18),
+        true,
+        rgb(22, 33, 38),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &model.registry,
+        scale_rect(layout.width, layout.height, 908, 738, 1020, 776),
+        layout.font(22),
+        true,
+        rgb(22, 33, 38),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &model.aircraft_type,
+        scale_rect(layout.width, layout.height, 908, 818, 1020, 850),
+        layout.font(17),
+        false,
+        rgb(22, 33, 38),
+        Align::Left,
+    );
+    for (value, rect) in [
+        (
+            &model.heading,
+            scale_rect(layout.width, layout.height, 1088, 766, 1148, 808),
+        ),
+        (
+            &model.speed,
+            scale_rect(layout.width, layout.height, 1158, 766, 1235, 808),
+        ),
+        (
+            &model.altitude,
+            scale_rect(layout.width, layout.height, 1248, 766, 1324, 808),
+        ),
+        (
+            &model.squawk,
+            scale_rect(layout.width, layout.height, 1330, 766, 1370, 808),
+        ),
+    ] {
         draw_text(
             hdc,
-            title,
-            rect_xy(
-                panel.left + 16,
-                panel.top + 10,
-                panel.right - 14,
-                panel.top + 34,
-            ),
-            15,
+            value,
+            rect,
+            layout.font(20),
             true,
-            rgb(32, 34, 32),
-            Align::Left,
+            rgb(22, 33, 38),
+            Align::Center,
         );
-        draw_line(
-            hdc,
-            panel.left + 16,
-            panel.top + 38,
-            panel.right - 16,
-            panel.top + 38,
-            rgb(126, 94, 55),
-            1,
-        );
-        draw_text(
-            hdc,
-            body,
-            rect_xy(
-                panel.left + 18,
-                panel.top + 48,
-                panel.right - 18,
-                panel.bottom - 14,
-            ),
-            if idx == 0 { 15 } else { 18 },
-            idx != 0,
-            if idx == 1 {
-                rgb(113, 25, 23)
-            } else {
-                rgb(22, 33, 38)
-            },
-            Align::Left,
-        );
-        x = right;
     }
+    draw_text(
+        hdc,
+        &compact_time(&model.updated),
+        scale_rect(layout.width, layout.height, 1418, 738, 1630, 780),
+        layout.font(24),
+        true,
+        rgb(22, 33, 38),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &model.location,
+        scale_rect(layout.width, layout.height, 1418, 780, 1630, 812),
+        layout.font(16),
+        false,
+        rgb(22, 33, 38),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &model.position,
+        scale_rect(layout.width, layout.height, 1418, 818, 1630, 850),
+        layout.font(16),
+        false,
+        rgb(22, 33, 38),
+        Align::Left,
+    );
 }
 
 /// Full text report panel shown on the RAW REPORT tab.
 #[cfg(windows)]
-fn draw_raw_report(hdc: HDC, area: RECT, report: &str) {
-    draw_panel(hdc, area, rgb(228, 211, 176), rgb(97, 69, 39));
-    let clip = inset(area, 24, 18);
+fn draw_raw_report(hdc: HDC, layout: &Layout, report: &str, scroll_lines: usize) {
+    let area = layout.main;
+    draw_bmp_stretched(hdc, area, ASSET_RAW_REPORT);
+    let clip = inset(area, layout.sx(24), layout.sy(18));
+    let body = rect_xy(clip.left, clip.top + layout.sy(46), clip.right, clip.bottom);
+    let max_scroll = raw_report_max_scroll_lines(layout, report);
+    let scroll_lines = scroll_lines.min(max_scroll);
+    let visible_report = report
+        .lines()
+        .skip(scroll_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
     draw_text(
         hdc,
         "RAW REPORT",
-        rect_xy(clip.left, clip.top, clip.right, clip.top + 30),
-        20,
+        rect_xy(clip.left, clip.top, clip.right, clip.top + layout.sy(30)),
+        layout.font(20),
         true,
         rgb(139, 26, 22),
         Align::Left,
@@ -1479,26 +1878,92 @@ fn draw_raw_report(hdc: HDC, area: RECT, report: &str) {
     draw_line(
         hdc,
         clip.left,
-        clip.top + 36,
+        clip.top + layout.sy(36),
         clip.right,
-        clip.top + 36,
+        clip.top + layout.sy(36),
         rgb(151, 114, 61),
-        1,
+        scale_len(layout.width, 1),
     );
-    draw_mono_text(
+    draw_mono_text(hdc, &visible_report, body, layout.font(15), rgb(28, 36, 38));
+    draw_raw_scrollbar(hdc, layout, body, scroll_lines, max_scroll);
+}
+
+#[cfg(windows)]
+fn raw_report_max_scroll_lines(layout: &Layout, report: &str) -> usize {
+    let area = layout.main;
+    let clip = inset(area, layout.sx(24), layout.sy(18));
+    let body_height = (clip.bottom - (clip.top + layout.sy(46))).max(1);
+    let line_height = raw_report_line_height(layout).max(1);
+    let visible_lines = (body_height / line_height).max(1) as usize;
+    report.lines().count().saturating_sub(visible_lines)
+}
+
+#[cfg(windows)]
+fn raw_report_line_height(layout: &Layout) -> i32 {
+    layout.font(15) + layout.sy(5).max(3)
+}
+
+#[cfg(windows)]
+fn draw_raw_scrollbar(
+    hdc: HDC,
+    layout: &Layout,
+    body: RECT,
+    scroll_lines: usize,
+    max_scroll: usize,
+) {
+    if max_scroll == 0 {
+        return;
+    }
+    let track = rect_xy(
+        body.right - layout.sx(12),
+        body.top,
+        body.right - layout.sx(7),
+        body.bottom,
+    );
+    fill_rect(hdc, track, rgb(181, 152, 100));
+    let track_h = (track.bottom - track.top).max(1);
+    let thumb_h = (track_h / 4).max(layout.sy(26));
+    let travel = (track_h - thumb_h).max(1);
+    let thumb_top = track.top + (travel as usize * scroll_lines / max_scroll) as i32;
+    fill_rect(
         hdc,
-        report,
-        rect_xy(clip.left, clip.top + 46, clip.right, clip.bottom),
-        15,
-        rgb(28, 36, 38),
+        rect_xy(track.left, thumb_top, track.right, thumb_top + thumb_h),
+        rgb(111, 38, 30),
     );
 }
 
-/// A brass push-button used for the REFRESH control.
+/// Draw a compact heading arrow for the table's MOTION column.
 #[cfg(windows)]
-fn draw_button(hdc: HDC, label: &str, rect: RECT) {
-    draw_panel(hdc, rect, rgb(118, 18, 17), rgb(176, 132, 66));
-    draw_text(hdc, label, inset(rect, 8, 4), 16, true, rgb(244, 228, 196), Align::Center);
+fn draw_heading_arrow(hdc: HDC, rect: RECT, track: Option<f64>, color: COLORREF, width: i32) {
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    let span = ((rect.right - rect.left).min(rect.bottom - rect.top)).max(8);
+    let line_width = scale_len(width, 2);
+    let Some(track) = track else {
+        let half = span / 5;
+        draw_line(hdc, cx - half, cy, cx + half, cy, color, line_width);
+        return;
+    };
+
+    let angle = track.rem_euclid(360.0).to_radians();
+    let dx = angle.sin();
+    let dy = -angle.cos();
+    let length = (span as f64) * 0.72;
+    let tail = length * 0.34;
+    let head = length * 0.46;
+    let x1 = cx - (dx * tail) as i32;
+    let y1 = cy - (dy * tail) as i32;
+    let x2 = cx + (dx * head) as i32;
+    let y2 = cy + (dy * head) as i32;
+    draw_line(hdc, x1, y1, x2, y2, color, line_width);
+
+    let wing_len = (span as f64) * 0.22;
+    for turn in [-2.45_f64, 2.45_f64] {
+        let wing_angle = angle + turn;
+        let wx = x2 + (wing_angle.sin() * wing_len) as i32;
+        let wy = y2 - (wing_angle.cos() * wing_len) as i32;
+        draw_line(hdc, x2, y2, wx, wy, color, line_width);
+    }
 }
 
 /// Draw a small aircraft glyph rotated to its heading (North up).
@@ -1546,8 +2011,8 @@ fn draw_plane_marker(
 #[cfg(windows)]
 fn compass16(degrees: f64) -> &'static str {
     const POINTS: [&str; 16] = [
-        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW",
-        "NNW",
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
     ];
     let normalized = degrees.rem_euclid(360.0);
     let index = ((normalized / 22.5).round() as usize) % 16;
@@ -1597,41 +2062,162 @@ fn ui_flight_level(baro_altitude_m: Option<f64>) -> String {
 }
 
 #[cfg(windows)]
-fn draw_panel(hdc: HDC, rect: RECT, fill: COLORREF, border: COLORREF) {
-    unsafe {
-        let brush = CreateSolidBrush(fill);
-        let pen = CreatePen(PS_SOLID, 2, border);
-        let old_brush = SelectObject(hdc, HGDIOBJ::from(brush));
-        let old_pen = SelectObject(hdc, HGDIOBJ::from(pen));
-        let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 10, 10);
-        let _ = SelectObject(hdc, old_pen);
-        let _ = SelectObject(hdc, old_brush);
-        let _ = DeleteObject(HGDIOBJ::from(pen));
-        let _ = DeleteObject(HGDIOBJ::from(brush));
+fn draw_target_brackets(hdc: HDC, cx: i32, cy: i32, radius: i32, color: COLORREF, width: i32) {
+    let len = scale_len(width, 12);
+    let line_width = scale_len(width, 2);
+    for (sx, sy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+        let x = cx + sx * radius;
+        let y = cy + sy * radius;
+        draw_line(hdc, x, y, x - sx * len, y, color, line_width);
+        draw_line(hdc, x, y, x, y - sy * len, color, line_width);
     }
 }
 
 #[cfg(windows)]
-fn draw_segment(hdc: HDC, label: &str, rect: RECT, selected: bool) {
-    draw_panel(
-        hdc,
-        rect,
-        if selected {
-            rgb(118, 18, 17)
-        } else {
-            rgb(18, 31, 42)
+struct DecodedPng {
+    width: i32,
+    height: i32,
+    bgra: Vec<u8>,
+}
+
+#[cfg(windows)]
+fn draw_png_background_1x(hdc: HDC) {
+    let Some(image) = decoded_background_png() else {
+        return;
+    };
+    draw_decoded_png_1x(hdc, 0, 0, image);
+}
+
+#[cfg(windows)]
+fn decoded_background_png() -> Option<&'static DecodedPng> {
+    static BACKGROUND: OnceLock<Option<DecodedPng>> = OnceLock::new();
+    BACKGROUND
+        .get_or_init(|| decode_png_to_bgra(ASSET_BACKGROUND_PNG))
+        .as_ref()
+}
+
+#[cfg(windows)]
+fn decode_png_to_bgra(bytes: &[u8]) -> Option<DecodedPng> {
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
+    for pixel in rgba.pixels() {
+        let [red, green, blue, alpha] = pixel.0;
+        bgra.extend_from_slice(&[blue, green, red, alpha]);
+    }
+    Some(DecodedPng {
+        width: width as i32,
+        height: height as i32,
+        bgra,
+    })
+}
+
+#[cfg(windows)]
+fn draw_decoded_png_1x(hdc: HDC, x: i32, y: i32, image: &DecodedPng) {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: image.width,
+            // Negative height makes the DIB top-down, matching PNG scanline order.
+            biHeight: -image.height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: image.bgra.len() as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
         },
-        rgb(88, 72, 53),
-    );
-    draw_text(
-        hdc,
-        label,
-        inset(rect, 6, 4),
-        16,
-        true,
-        rgb(238, 222, 188),
-        Align::Center,
-    );
+        bmiColors: [RGBQUAD::default()],
+    };
+    unsafe {
+        let _ = StretchDIBits(
+            hdc,
+            x,
+            y,
+            image.width,
+            image.height,
+            0,
+            0,
+            image.width,
+            image.height,
+            Some(image.bgra.as_ptr() as *const core::ffi::c_void),
+            &info,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn draw_bmp_stretched(hdc: HDC, rect: RECT, bytes: &[u8]) {
+    let Some((width, height, bit_count, pixel_offset)) = bmp_info(bytes) else {
+        fill_rect(hdc, rect, rgb(18, 28, 34));
+        return;
+    };
+    let row_stride = (((width as usize * bit_count as usize) + 31) / 32) * 4;
+    let image_size = row_stride.saturating_mul(height as usize);
+    if bytes.len() < pixel_offset.saturating_add(image_size) {
+        fill_rect(hdc, rect, rgb(18, 28, 34));
+        return;
+    }
+
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: height,
+            biPlanes: 1,
+            biBitCount: bit_count,
+            biCompression: BI_RGB.0,
+            biSizeImage: image_size as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [RGBQUAD::default()],
+    };
+    unsafe {
+        let _ = StretchDIBits(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            0,
+            0,
+            width,
+            height,
+            Some(bytes[pixel_offset..].as_ptr() as *const core::ffi::c_void),
+            &info,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn bmp_info(bytes: &[u8]) -> Option<(i32, i32, u16, usize)> {
+    if bytes.len() < 54 || bytes.get(0..2)? != b"BM" {
+        return None;
+    }
+    let pixel_offset = u32::from_le_bytes(bytes.get(10..14)?.try_into().ok()?) as usize;
+    let width = i32::from_le_bytes(bytes.get(18..22)?.try_into().ok()?);
+    let height = i32::from_le_bytes(bytes.get(22..26)?.try_into().ok()?);
+    let planes = u16::from_le_bytes(bytes.get(26..28)?.try_into().ok()?);
+    let bit_count = u16::from_le_bytes(bytes.get(28..30)?.try_into().ok()?);
+    let compression = u32::from_le_bytes(bytes.get(30..34)?.try_into().ok()?);
+    if width <= 0
+        || height <= 0
+        || planes != 1
+        || !matches!(bit_count, 24 | 32)
+        || compression != BI_RGB.0
+    {
+        return None;
+    }
+    Some((width, height, bit_count, pixel_offset))
 }
 
 #[cfg(windows)]
@@ -1654,7 +2240,7 @@ fn draw_text(
     align: Align,
 ) {
     unsafe {
-        let face = to_wide("Segoe UI");
+        let face = to_wide("Bahnschrift");
         let font = CreateFontW(
             -size,
             0,
@@ -1682,12 +2268,12 @@ fn draw_text(
             Align::Center => DT_CENTER,
             Align::Right => DT_RIGHT,
         };
-        let mut format = windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
-            format.0 | DT_WORDBREAK.0 | DT_END_ELLIPSIS.0,
-        );
-        if !text.contains('\n') {
+        let rect_h = rect.bottom - rect.top;
+        let single_line = !text.contains('\n') && rect_h <= size * 2 + 4;
+        let mut format = windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(format.0 | DT_WORDBREAK.0);
+        if single_line {
             format = windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
-                format.0 | DT_SINGLELINE.0 | DT_VCENTER.0,
+                format.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_END_ELLIPSIS.0,
             );
         }
         let mut wide = text.encode_utf16().collect::<Vec<u16>>();
@@ -1767,19 +2353,6 @@ fn fill_ellipse(
 }
 
 #[cfg(windows)]
-fn ellipse_outline(
-    hdc: HDC,
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-    color: COLORREF,
-    width: i32,
-) {
-    fill_ellipse(hdc, left, top, right, bottom, rgb(10, 48, 68), color, width);
-}
-
-#[cfg(windows)]
 #[derive(Clone, Copy)]
 enum Align {
     Left,
@@ -1795,6 +2368,36 @@ fn rect_xy(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
         right,
         bottom,
     }
+}
+
+#[cfg(windows)]
+fn scale_x(width: i32, value: i32) -> i32 {
+    width * value / DESIGN_WIDTH
+}
+
+#[cfg(windows)]
+fn scale_y(height: i32, value: i32) -> i32 {
+    height * value / DESIGN_HEIGHT
+}
+
+#[cfg(windows)]
+fn scale_len(width: i32, value: i32) -> i32 {
+    (width * value / DESIGN_WIDTH).max(1)
+}
+
+#[cfg(windows)]
+fn scale_font(width: i32, size: i32) -> i32 {
+    (width * size / DESIGN_WIDTH).max(8)
+}
+
+#[cfg(windows)]
+fn scale_rect(width: i32, height: i32, left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+    rect_xy(
+        scale_x(width, left),
+        scale_y(height, top),
+        scale_x(width, right),
+        scale_y(height, bottom),
+    )
 }
 
 #[cfg(windows)]
@@ -1989,6 +2592,16 @@ fn enrich_aircraft(aircraft: &mut NearestAircraft, client: &ApiClient) {
     let classification = classify_aircraft(&aircraft.state, metadata.as_ref(), faa.as_ref());
 
     aircraft.nearest_place = place;
+    aircraft.metadata = metadata;
+    aircraft.faa = faa;
+    aircraft.classification = classification;
+}
+
+fn enrich_aircraft_table_details(aircraft: &mut NearestAircraft, client: &ApiClient) {
+    let metadata = fetch_adsbdb_metadata(&aircraft.state, client);
+    let faa = fetch_faa_metadata(&aircraft.state, client);
+    let classification = classify_aircraft(&aircraft.state, metadata.as_ref(), faa.as_ref());
+
     aircraft.metadata = metadata;
     aircraft.faa = faa;
     aircraft.classification = classification;
