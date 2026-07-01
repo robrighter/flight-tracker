@@ -1,4 +1,9 @@
-use chrono::{DateTime, Utc};
+// Build as a GUI-subsystem app on Windows so launching the desktop dashboard
+// never spawns a background console window. CLI runs re-attach to the parent
+// terminal at startup (see `attach_parent_console`) so their output still shows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+use chrono::{DateTime, Timelike, Utc};
 use clap::{Parser, ValueEnum};
 use reqwest::blocking::{Client, Response};
 use scraper::{Html, Selector};
@@ -28,13 +33,16 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, REC
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS,
+    CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC,
-    DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_BOLD, FW_NORMAL, FillRect, HDC,
-    HGDIOBJ, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, Polygon,
-    RGBQUAD, SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
-    UpdateWindow,
+    DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_BOLD, FW_NORMAL, FillRect,
+    GetStockObject, HDC, HGDIOBJ, HOLLOW_BRUSH, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, PS_SOLID, Polygon,
+    RGBQUAD, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
+    TRANSPARENT, UpdateWindow,
 };
+#[cfg(windows)]
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 #[cfg(windows)]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
@@ -174,7 +182,7 @@ struct Cli {
     debug: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Units {
     Metric,
     Imperial,
@@ -263,27 +271,34 @@ struct JsonOutput {
 struct UiModel {
     callsign: String,
     operator: String,
-    route_detail: String,
+    /// Compact airport codes for the ROUTE panel, e.g. "KLAX → KSFO".
+    route_codes: String,
+    /// Scheduled departure / arrival strings if the route feed carries them.
+    departs: String,
+    arrives: String,
     summary: String,
     altitude: String,
-    speed: String,
     heading: String,
     registry: String,
     aircraft_type: String,
-    squawk: String,
-    position: String,
     updated: String,
-    location: String,
+    /// Live values behind the MOTION gauges (None → no needle / dashes).
+    track_deg: Option<f64>,
+    speed_kt: Option<f64>,
+    vertical_fpm: Option<f64>,
+    /// UPDATED panel: date line ("20 MAY 2025") and clock-hand positions
+    /// (hour in [0,12), minute in [0,60), second in [0,60)).
+    date: String,
+    clock: Option<(f64, f64, f64)>,
 }
 
 #[cfg(windows)]
 impl UiModel {
-    fn from_flight(location: &Location, nearest: &NearestAircraft, units: Units) -> Self {
+    fn from_flight(_location: &Location, nearest: &NearestAircraft, units: Units) -> Self {
         let state = &nearest.state;
         let metadata = nearest.metadata.as_ref();
         let aircraft = nested_object(metadata, &["aircraft"]);
         let flightroute = nested_object(metadata, &["flightroute"]);
-        let route_detail = format_route_detail_for_ui(flightroute);
         let registry = aircraft
             .and_then(|aircraft| object_str(Some(aircraft), "registration"))
             .or_else(|| {
@@ -321,24 +336,45 @@ impl UiModel {
         // shown in standard aviation units (knots, flight level) like the mock.
         let _ = units;
 
+        let route_codes = format_route_codes_for_ui(flightroute);
+        let departs = flightroute
+            .and_then(|route| object_str(Some(route), "scheduled_departure"))
+            .unwrap_or_default();
+        let arrives = flightroute
+            .and_then(|route| object_str(Some(route), "scheduled_arrival"))
+            .unwrap_or_default();
+        let (date, clock) = match nearest
+            .api_time
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+        {
+            Some(time) => (
+                time.format("%d %b %Y").to_string().to_uppercase(),
+                Some((
+                    (time.hour() % 12) as f64 + time.minute() as f64 / 60.0,
+                    time.minute() as f64 + time.second() as f64 / 60.0,
+                    time.second() as f64,
+                )),
+            ),
+            None => (String::new(), None),
+        };
+
         Self {
             callsign,
             operator,
-            route_detail,
+            route_codes,
+            departs,
+            arrives,
             summary: ui_summary_card(nearest, units),
             altitude: ui_flight_level(state.baro_altitude),
-            speed: ui_speed(state.velocity),
             heading: ui_heading(state.true_track),
             registry,
             aircraft_type,
-            squawk: string_or_unknown(state.squawk.as_deref()),
-            position: format!(
-                "{}, {}",
-                format_float(state.latitude, 4),
-                format_float(state.longitude, 4)
-            ),
             updated,
-            location: location.label.clone(),
+            track_deg: state.true_track,
+            speed_kt: state.velocity.map(|mps| mps * MPS_TO_KNOTS),
+            vertical_fpm: state.vertical_rate.map(|mps| mps * M_TO_FEET * 60.0),
+            date,
+            clock,
         }
     }
 }
@@ -529,7 +565,20 @@ impl UiState {
     }
 }
 
+/// Re-attach to the launching terminal's console, if there is one. Because the
+/// binary is built for the Windows GUI subsystem (no auto-allocated console),
+/// this is what lets CLI output appear when the tool is run from a shell, while
+/// a double-click / `Start-Process` launch of the dashboard shows no terminal.
+#[cfg(windows)]
+fn attach_parent_console() {
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -565,7 +614,16 @@ fn run() -> AppResult<()> {
             ));
         }
         let client = ApiClient::new(args.timeout)?;
-        let location = resolve_location(&args, &client)?;
+        let mut location = resolve_location(&args, &client)?;
+        // Give the observer's own location a human-readable city label for the
+        // status bar (Windows/CLI labels are generic); keep coords on failure.
+        if let Some(place) = reverse_geocode(location.latitude, location.longitude, &client) {
+            location.label = match (place.city, place.region) {
+                (Some(city), Some(region)) => format!("{city}, {region}"),
+                (Some(city), None) => city,
+                _ => place.label,
+            };
+        }
         let aircraft = Vec::new();
         let state = UiState::new(client, location, args.radius_km, args.units, aircraft);
         return run_dashboard_window(state);
@@ -782,14 +840,28 @@ fn compute_layout(width: i32, height: i32) -> Layout {
         raw_tab: rect_xy(sx(739), sy(15), sx(938), sy(64)),
         nm_btn: rect_xy(sx(1084), sy(16), sx(1162), sy(63)),
         km_btn: rect_xy(sx(1163), sy(16), sx(1236), sy(63)),
-        minimize_btn: rect_xy(sx(1510), sy(20), sx(1576), sy(58)),
-        close_btn: rect_xy(sx(1584), sy(20), sx(1648), sy(58)),
+        minimize_btn: rect_xy(sx(1547), sy(19), sx(1597), sy(54)),
+        close_btn: rect_xy(sx(1599), sy(19), sx(1648), sy(54)),
         main: rect_xy(sx(14), sy(78), sx(1659), sy(868)),
         radar: rect_xy(sx(933), sy(78), sx(1660), sy(674)),
         bottom: rect_xy(sx(14), sy(686), sx(1659), sy(868)),
         board_clip,
         row_y,
         row_h: sy(84).max(1),
+    }
+}
+
+/// Clip the frameless window to a rounded rectangle so its corners match the
+/// rounded frame painted into the background art (otherwise the square window
+/// shows the art's dark corner pixels). The radius tracks the art: ~14px in the
+/// 1672-wide design space, scaled to the live client size.
+#[cfg(windows)]
+fn apply_rounded_region(hwnd: HWND, width: i32, height: i32) {
+    let diameter = (2 * 14 * width / DESIGN_WIDTH).max(2);
+    unsafe {
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+        // The window owns the region after this call; Windows frees it.
+        let _ = SetWindowRgn(hwnd, Some(region), true);
     }
 }
 
@@ -854,6 +926,7 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
             ));
         }
         let _ = ShowWindow(hwnd, SW_SHOW);
+        apply_rounded_region(hwnd, WINDOW_WIDTH, WINDOW_HEIGHT);
         let _ = UpdateWindow(hwnd);
         refresh_dashboard(hwnd, true);
 
@@ -890,6 +963,10 @@ extern "system" fn dashboard_window_proc(
             // the default background erase to avoid flicker.
             WM_ERASEBKGND => LRESULT(1),
             WM_SIZE => {
+                let mut rect = RECT::default();
+                if GetClientRect(hwnd, &mut rect).is_ok() {
+                    apply_rounded_region(hwnd, rect.right - rect.left, rect.bottom - rect.top);
+                }
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
@@ -1221,6 +1298,7 @@ fn draw_dashboard(hdc: HDC, rect: RECT, state: &UiState) {
         fill_rect(hdc, shell, rgb(8, 18, 27));
         draw_png_background_1x(hdc);
         draw_tab_state(hdc, &layout, state.tab);
+        draw_unit_toggle(hdc, &layout, state.units);
 
         let model = state
             .selected_aircraft()
@@ -1250,6 +1328,8 @@ fn draw_dashboard(hdc: HDC, rect: RECT, state: &UiState) {
                 draw_raw_report(hdc, &layout, &state.report, state.raw_scroll_lines);
             }
         }
+
+        draw_status_bar(hdc, &layout, &state.location, &state.status);
     }
 }
 
@@ -1357,10 +1437,9 @@ struct RowView {
 #[cfg(windows)]
 fn row_view(aircraft: &NearestAircraft, units: Units) -> RowView {
     let state = &aircraft.state;
-    let route = nested_object(aircraft.metadata.as_ref(), &["flightroute"])
-        .map(|flightroute| format_primary_route_for_ui(Some(flightroute)))
-        .filter(|route| !route.is_empty())
-        .unwrap_or_else(|| "\u{2014}".to_string());
+    // Compact ICAO codes ("KLAX → KSFO") like the mock and the ROUTE detail box,
+    // so the narrow board column never wraps onto two lines.
+    let route = format_route_codes_for_ui(nested_object(aircraft.metadata.as_ref(), &["flightroute"]));
     let operator = aircraft
         .classification
         .operator
@@ -1397,13 +1476,25 @@ fn ui_summary_card(nearest: &NearestAircraft, units: Units) -> String {
         .map(str::trim)
         .filter(|callsign| !callsign.is_empty())
         .unwrap_or("This aircraft");
-    format!(
-        "{callsign} is nearest aircraft.\n{} away {}.\nAltitude {}.\nSpeed {}.",
-        ui_distance(nearest.distance_km, units),
-        compass16(nearest.bearing_degrees),
-        ui_flight_level(nearest.state.baro_altitude),
-        ui_speed(nearest.state.velocity),
-    )
+    let mut lines = vec![
+        format!("{callsign} is nearest aircraft."),
+        format!(
+            "{} away {}.",
+            ui_distance(nearest.distance_km, units),
+            compass16(nearest.bearing_degrees),
+        ),
+    ];
+    // City the aircraft is currently over (reverse-geocoded during enrichment).
+    if let Some(city) = nearest
+        .nearest_place
+        .as_ref()
+        .and_then(|place| place.city.clone().or_else(|| place.region.clone()))
+    {
+        lines.push(format!("Over {city}."));
+    }
+    lines.push(format!("Altitude {}.", ui_flight_level(nearest.state.baro_altitude)));
+    lines.push(format!("Speed {}.", ui_speed(nearest.state.velocity)));
+    lines.join("\n")
 }
 
 #[cfg(windows)]
@@ -1413,15 +1504,14 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
     let sy = |value: i32| layout.sy(value);
     let font = |size: i32| layout.font(size);
     let header_y = clip.top + sy(58);
-    // Columns are proportional to the (narrow) board width so the OPERATOR /
-    // ROUTE / MOTION headers never collide regardless of window size.
-    let w = clip.right - clip.left;
-    let col = [
-        clip.left + sx(72),
-        clip.left + w * 34 / 100,
-        clip.left + w * 57 / 100,
-        clip.left + w * 77 / 100,
-    ];
+    // Column data left-aligns at these design-space x's so it sits under the
+    // baked SUMMARY / OPERATOR / ROUTE / MOTION headers (which are centred over
+    // each column's content in the art). Everything scales with the window.
+    let col = [sx(118), sx(296), sx(478), sx(692)];
+    // Divider lines sit at the midpoints between the baked header labels (matched
+    // to the mock), so each header is centred in its column. Cells clip just shy
+    // of the divider on their right so text never crosses the line.
+    let div = [sx(256), sx(449), sx(648)];
     let row_h = layout.row_h;
     let count = state.aircraft.len().min(UI_LIST_LIMIT);
     for idx in 0..UI_LIST_LIMIT {
@@ -1436,29 +1526,11 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         }
         let view = row_view(&state.aircraft[idx], state.units);
 
-        if !selected {
-            fill_ellipse(
-                hdc,
-                row.left + sx(14),
-                row.top + row_h / 2 - sy(5),
-                row.left + sx(24),
-                row.top + row_h / 2 + sy(5),
-                rgb(44, 53, 54),
-                rgb(229, 210, 174),
-                scale_len(layout.width, 1),
-            );
-        }
-
         let text_dark = rgb(21, 31, 35);
         draw_text(
             hdc,
             &view.callsign,
-            rect_xy(
-                clip.left + sx(72),
-                row.top + sy(14),
-                col[1] - sx(10),
-                row.top + sy(45),
-            ),
+            rect_xy(col[0], row.top + sy(14), div[0] - sx(8), row.top + sy(45)),
             font(22),
             true,
             text_dark,
@@ -1467,12 +1539,7 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.sub,
-            rect_xy(
-                clip.left + sx(72),
-                row.top + sy(46),
-                col[1] - sx(12),
-                row.top + sy(70),
-            ),
+            rect_xy(col[0], row.top + sy(46), div[0] - sx(8), row.top + sy(70)),
             font(14),
             true,
             rgb(141, 26, 22),
@@ -1481,7 +1548,7 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.operator,
-            rect_xy(col[1], row.top + sy(12), col[2] - sx(18), row.top + sy(72)),
+            rect_xy(col[1], row.top + sy(12), div[1] - sx(8), row.top + sy(72)),
             font(15),
             false,
             text_dark,
@@ -1490,7 +1557,7 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.route,
-            rect_xy(col[2], row.top + sy(12), col[3] - sx(18), row.top + sy(72)),
+            rect_xy(col[2], row.top + sy(12), div[2] - sx(8), row.top + sy(72)),
             font(15),
             true,
             text_dark,
@@ -1499,7 +1566,7 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_text(
             hdc,
             &view.motion_heading,
-            rect_xy(col[3], row.top + sy(16), col[3] + sx(62), row.top + sy(44)),
+            rect_xy(col[3], row.top + sy(16), col[3] + sx(60), row.top + sy(44)),
             font(16),
             true,
             text_dark,
@@ -1509,9 +1576,9 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
             hdc,
             &view.motion_speed,
             rect_xy(
-                col[3] + sx(70),
+                col[3] + sx(66),
                 row.top + sy(16),
-                clip.right - sx(40),
+                clip.right - sx(16),
                 row.top + sy(44),
             ),
             font(16),
@@ -1522,22 +1589,22 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
         draw_heading_arrow(
             hdc,
             rect_xy(
-                col[3] + sx(4),
-                row.top + sy(42),
-                col[3] + sx(36),
+                col[3] + sx(2),
+                row.top + sy(44),
+                col[3] + sx(30),
                 row.top + sy(72),
             ),
             view.motion_track,
-            text_dark,
+            rgb(80, 60, 40),
             layout.width,
         );
         draw_text(
             hdc,
             &view.motion_altitude,
             rect_xy(
-                col[3] + sx(42),
+                col[3] + sx(36),
                 row.top + sy(46),
-                clip.right - sx(40),
+                clip.right - sx(16),
                 row.top + sy(72),
             ),
             font(15),
@@ -1545,23 +1612,9 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
             rgb(80, 60, 40),
             Align::Left,
         );
-        draw_text(
-            hdc,
-            ">",
-            rect_xy(
-                clip.right - sx(36),
-                row.top + sy(22),
-                clip.right - sx(12),
-                row.top + sy(58),
-            ),
-            font(30),
-            true,
-            rgb(18, 26, 29),
-            Align::Center,
-        );
     }
 
-    for x in [col[1] - sx(18), col[2] - sx(14), col[3] - sx(16)] {
+    for x in div {
         draw_line(
             hdc,
             x,
@@ -1695,20 +1748,6 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
         );
     }
 
-    draw_text(
-        hdc,
-        &state.status,
-        rect_xy(
-            area.left + sx(24),
-            area.bottom - sy(46),
-            area.right - sx(28),
-            area.bottom - sy(20),
-        ),
-        font(15),
-        true,
-        rgb(126, 220, 118),
-        Align::Right,
-    );
 }
 
 /// Project an aircraft's bearing/distance onto the radar scope (North up).
@@ -1723,6 +1762,37 @@ fn radar_point(
     let r = usable * (aircraft.distance_km / span_km).clamp(0.0, 1.0);
     let angle = (aircraft.bearing_degrees - 90.0).to_radians();
     (cx + (angle.cos() * r) as i32, cy + (angle.sin() * r) as i32)
+}
+
+/// Status strip across the very bottom of the window: the observer's own
+/// location on the left, and the live feed status (amber, matching the lamps
+/// baked into the bar) on the right — flanking the centre emblem.
+#[cfg(windows)]
+fn draw_status_bar(hdc: HDC, layout: &Layout, location: &Location, status: &str) {
+    let here = format!(
+        "{}     {:.3}, {:.3}",
+        location.label.to_uppercase(),
+        location.latitude,
+        location.longitude,
+    );
+    draw_text(
+        hdc,
+        &here,
+        scale_rect(layout.width, layout.height, 100, 886, 730, 920),
+        layout.font(15),
+        true,
+        rgb(202, 190, 156),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        status,
+        scale_rect(layout.width, layout.height, 946, 886, 1520, 920),
+        layout.font(15),
+        true,
+        rgb(236, 190, 80),
+        Align::Right,
+    );
 }
 
 #[cfg(windows)]
@@ -1768,15 +1838,39 @@ fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status
         rgb(113, 25, 23),
         Align::Left,
     );
+    // ROUTE — compact airport codes like the mock ("KLAX → KSFO"); scheduled
+    // times sit under the baked Departs/Arrives labels when the feed has them.
     draw_text(
         hdc,
-        &model.route_detail,
-        scale_rect(layout.width, layout.height, 658, 738, 850, 848),
-        layout.font(18),
+        &model.route_codes,
+        scale_rect(layout.width, layout.height, 656, 744, 852, 792),
+        layout.font(26),
         true,
         rgb(22, 33, 38),
-        Align::Left,
+        Align::Center,
     );
+    if !model.departs.is_empty() {
+        draw_text(
+            hdc,
+            &model.departs,
+            scale_rect(layout.width, layout.height, 658, 820, 752, 850),
+            layout.font(16),
+            true,
+            rgb(22, 33, 38),
+            Align::Left,
+        );
+    }
+    if !model.arrives.is_empty() {
+        draw_text(
+            hdc,
+            &model.arrives,
+            scale_rect(layout.width, layout.height, 756, 820, 852, 850),
+            layout.font(16),
+            true,
+            rgb(22, 33, 38),
+            Align::Left,
+        );
+    }
     draw_text(
         hdc,
         &model.registry,
@@ -1795,61 +1889,327 @@ fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status
         rgb(22, 33, 38),
         Align::Left,
     );
-    for (value, rect) in [
-        (
-            &model.heading,
-            scale_rect(layout.width, layout.height, 1088, 766, 1148, 808),
-        ),
-        (
-            &model.speed,
-            scale_rect(layout.width, layout.height, 1158, 766, 1235, 808),
-        ),
-        (
-            &model.altitude,
-            scale_rect(layout.width, layout.height, 1248, 766, 1324, 808),
-        ),
-        (
-            &model.squawk,
-            scale_rect(layout.width, layout.height, 1330, 766, 1370, 808),
-        ),
-    ] {
-        draw_text(
-            hdc,
-            value,
-            rect,
-            layout.font(20),
-            true,
-            rgb(22, 33, 38),
-            Align::Center,
-        );
+
+    // MOTION — analog gauges + vertical-speed / altitude readout, like the mock.
+    draw_hdg_gauge(hdc, layout, 1104, 767, 40, model.track_deg, &model.heading);
+    draw_speed_gauge(hdc, layout, 1207, 767, 39, model.speed_kt);
+    draw_motion_readout(hdc, layout, model);
+
+    // UPDATED — analog clock + timestamp + date, like the mock.
+    if let Some((hours, minutes, seconds)) = model.clock {
+        draw_clock(hdc, layout, 1451, 784, 44, hours, minutes, seconds);
     }
     draw_text(
         hdc,
         &compact_time(&model.updated),
-        scale_rect(layout.width, layout.height, 1418, 738, 1630, 780),
-        layout.font(24),
+        scale_rect(layout.width, layout.height, 1508, 752, 1650, 794),
+        layout.font(27),
         true,
         rgb(22, 33, 38),
         Align::Left,
     );
     draw_text(
         hdc,
-        &model.location,
-        scale_rect(layout.width, layout.height, 1418, 780, 1630, 812),
-        layout.font(16),
-        false,
-        rgb(22, 33, 38),
+        &model.date,
+        scale_rect(layout.width, layout.height, 1508, 800, 1650, 830),
+        layout.font(19),
+        true,
+        rgb(62, 50, 42),
+        Align::Left,
+    );
+}
+
+/// Speedometer number below the dial, plus the VS/ALT stack to its right.
+///
+/// The baked "VS / FT/MIN / ALT" labels were cleared from the art so this block
+/// can lay the two readouts out with mock-style spacing (label, value, divider).
+#[cfg(windows)]
+fn draw_motion_readout(hdc: HDC, layout: &Layout, model: &UiModel) {
+    let ink = rgb(22, 33, 38);
+    let label = rgb(96, 82, 68);
+    // Speed value sits under the dial, above the baked "KT" label.
+    let speed = model
+        .speed_kt
+        .map(|kt| format!("{kt:.0}"))
+        .unwrap_or_else(|| "\u{2014}".to_string());
+    draw_text(
+        hdc,
+        &speed,
+        scale_rect(layout.width, layout.height, 1168, 812, 1248, 844),
+        layout.font(22),
+        true,
+        ink,
+        Align::Center,
+    );
+
+    // Vertical speed: arrow + "VS" on one line, big value, then "FT/MIN".
+    let vs_value = match model.vertical_fpm {
+        Some(fpm) => {
+            draw_vertical_arrow(
+                hdc,
+                layout.sx(1298),
+                layout.sy(748),
+                layout.sy(772),
+                fpm >= 0.0,
+                ink,
+                scale_len(layout.width, 3),
+            );
+            format!("{:.0}", fpm.abs())
+        }
+        None => "\u{2014}".to_string(),
+    };
+    draw_text(
+        hdc,
+        "VS",
+        scale_rect(layout.width, layout.height, 1320, 748, 1376, 768),
+        layout.font(15),
+        true,
+        label,
         Align::Left,
     );
     draw_text(
         hdc,
-        &model.position,
-        scale_rect(layout.width, layout.height, 1418, 818, 1630, 850),
-        layout.font(16),
-        false,
-        rgb(22, 33, 38),
+        &vs_value,
+        scale_rect(layout.width, layout.height, 1300, 770, 1378, 800),
+        layout.font(23),
+        true,
+        ink,
         Align::Left,
     );
+    draw_text(
+        hdc,
+        "FT/MIN",
+        scale_rect(layout.width, layout.height, 1300, 801, 1378, 816),
+        layout.font(13),
+        true,
+        label,
+        Align::Left,
+    );
+
+    // Divider, then altitude / flight level.
+    draw_line(
+        hdc,
+        layout.sx(1294),
+        layout.sy(820),
+        layout.sx(1374),
+        layout.sy(820),
+        rgb(150, 120, 80),
+        scale_len(layout.width, 1),
+    );
+    draw_text(
+        hdc,
+        "ALT",
+        scale_rect(layout.width, layout.height, 1300, 824, 1378, 842),
+        layout.font(15),
+        true,
+        label,
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &model.altitude,
+        scale_rect(layout.width, layout.height, 1300, 840, 1378, 866),
+        layout.font(22),
+        true,
+        ink,
+        Align::Left,
+    );
+}
+
+/// Point on a circle: `deg` measured clockwise from straight up (compass style).
+#[cfg(windows)]
+fn polar(cx: i32, cy: i32, r: f64, deg: f64) -> (i32, i32) {
+    let rad = deg.to_radians();
+    (
+        cx + (r * rad.sin()).round() as i32,
+        cy - (r * rad.cos()).round() as i32,
+    )
+}
+
+/// Unfilled circle outline (rim) drawn on top of the panel texture.
+#[cfg(windows)]
+fn draw_circle(hdc: HDC, cx: i32, cy: i32, r: i32, color: COLORREF, width: i32) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, width, color);
+        let old_pen = SelectObject(hdc, HGDIOBJ::from(pen));
+        let old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+        let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+        let _ = SelectObject(hdc, old_brush);
+        let _ = SelectObject(hdc, old_pen);
+        let _ = DeleteObject(HGDIOBJ::from(pen));
+    }
+}
+
+/// Small filled triangle pointing down from `top_y` (used as the compass index).
+#[cfg(windows)]
+fn fill_triangle_down(hdc: HDC, cx: i32, top_y: i32, size: i32, color: COLORREF) {
+    unsafe {
+        let points = [
+            POINT { x: cx - size, y: top_y },
+            POINT { x: cx + size, y: top_y },
+            POINT { x: cx, y: top_y + size * 2 },
+        ];
+        let brush = CreateSolidBrush(color);
+        let pen = CreatePen(PS_SOLID, 1, color);
+        let old_brush = SelectObject(hdc, HGDIOBJ::from(brush));
+        let old_pen = SelectObject(hdc, HGDIOBJ::from(pen));
+        let _ = Polygon(hdc, &points);
+        let _ = SelectObject(hdc, old_brush);
+        let _ = SelectObject(hdc, old_pen);
+        let _ = DeleteObject(HGDIOBJ::from(brush));
+        let _ = DeleteObject(HGDIOBJ::from(pen));
+    }
+}
+
+/// Vertical arrow (climb = up, descent = down) with a small chevron head.
+#[cfg(windows)]
+fn draw_vertical_arrow(
+    hdc: HDC,
+    x: i32,
+    top: i32,
+    bottom: i32,
+    up: bool,
+    color: COLORREF,
+    width: i32,
+) {
+    draw_line(hdc, x, top, x, bottom, color, width);
+    let head = (bottom - top) / 3;
+    let (tip, back) = if up { (top, top + head) } else { (bottom, bottom - head) };
+    draw_line(hdc, x, tip, x - head / 2, back, color, width);
+    draw_line(hdc, x, tip, x + head / 2, back, color, width);
+}
+
+/// Heading indicator: rim, tick ring, red north index, needle, centre degrees.
+#[cfg(windows)]
+fn draw_hdg_gauge(hdc: HDC, layout: &Layout, dcx: i32, dcy: i32, dr: i32, track: Option<f64>, value: &str) {
+    let cx = layout.sx(dcx);
+    let cy = layout.sy(dcy);
+    let r = scale_len(layout.width, dr);
+    let ink = rgb(74, 60, 44);
+    draw_circle(hdc, cx, cy, r, ink, scale_len(layout.width, 2));
+    for i in 0..12 {
+        let major = i % 3 == 0;
+        let inner = r - scale_len(layout.width, if major { 9 } else { 5 });
+        let (ix, iy) = polar(cx, cy, inner as f64, i as f64 * 30.0);
+        let (ox, oy) = polar(cx, cy, r as f64, i as f64 * 30.0);
+        draw_line(hdc, ix, iy, ox, oy, ink, scale_len(layout.width, if major { 2 } else { 1 }));
+    }
+    fill_triangle_down(hdc, cx, cy - r + scale_len(layout.width, 1), scale_len(layout.width, 5), rgb(176, 42, 34));
+    if let Some(track) = track {
+        let (nx, ny) = polar(cx, cy, r as f64 * 0.9, track);
+        let (bx, by) = polar(cx, cy, r as f64 * 0.5, track);
+        draw_line(hdc, bx, by, nx, ny, rgb(176, 42, 34), scale_len(layout.width, 2));
+    }
+    draw_text(
+        hdc,
+        value,
+        rect_xy(cx - r, cy - scale_len(layout.width, 15), cx + r, cy + scale_len(layout.width, 15)),
+        layout.font(21),
+        true,
+        rgb(22, 33, 38),
+        Align::Center,
+    );
+}
+
+/// Speedometer: 270° tick arc with a red high-speed band, needle, hub.
+#[cfg(windows)]
+fn draw_speed_gauge(hdc: HDC, layout: &Layout, dcx: i32, dcy: i32, dr: i32, speed_kt: Option<f64>) {
+    let cx = layout.sx(dcx);
+    let cy = layout.sy(dcy);
+    let r = scale_len(layout.width, dr);
+    let ink = rgb(74, 60, 44);
+    const START: f64 = -135.0;
+    const SWEEP: f64 = 270.0;
+    const MAX: f64 = 550.0;
+    const RED_FROM: f64 = 0.66;
+    draw_circle(hdc, cx, cy, r, ink, scale_len(layout.width, 2));
+    for i in 0..=9 {
+        let f = i as f64 / 9.0;
+        let deg = START + SWEEP * f;
+        let major = i % 3 == 0;
+        let inner = r - scale_len(layout.width, if major { 8 } else { 5 });
+        let (ix, iy) = polar(cx, cy, inner as f64, deg);
+        let (ox, oy) = polar(cx, cy, r as f64, deg);
+        let color = if f >= RED_FROM { rgb(176, 42, 34) } else { ink };
+        draw_line(hdc, ix, iy, ox, oy, color, scale_len(layout.width, if major { 2 } else { 1 }));
+    }
+    // Thick red band along the high-speed portion of the rim.
+    let band = r - scale_len(layout.width, 2);
+    let mut prev: Option<(i32, i32)> = None;
+    let mut t = RED_FROM;
+    while t <= 1.0001 {
+        let point = polar(cx, cy, band as f64, START + SWEEP * t.min(1.0));
+        if let Some((px, py)) = prev {
+            draw_line(hdc, px, py, point.0, point.1, rgb(176, 42, 34), scale_len(layout.width, 3));
+        }
+        prev = Some(point);
+        t += 0.06;
+    }
+    if let Some(kt) = speed_kt {
+        let f = (kt / MAX).clamp(0.0, 1.0);
+        let (nx, ny) = polar(cx, cy, r as f64 * 0.82, START + SWEEP * f);
+        draw_line(hdc, cx, cy, nx, ny, rgb(176, 42, 34), scale_len(layout.width, 2));
+    }
+    let hub = scale_len(layout.width, 4);
+    fill_ellipse(hdc, cx - hub, cy - hub, cx + hub, cy + hub, rgb(40, 30, 24), ink, scale_len(layout.width, 1));
+}
+
+/// Analog clock: ivory face, hour ticks, hour/minute/second hands.
+#[cfg(windows)]
+fn draw_clock(hdc: HDC, layout: &Layout, dcx: i32, dcy: i32, dr: i32, hours: f64, minutes: f64, seconds: f64) {
+    let cx = layout.sx(dcx);
+    let cy = layout.sy(dcy);
+    let r = scale_len(layout.width, dr);
+    let ink = rgb(58, 46, 38);
+    fill_ellipse(hdc, cx - r, cy - r, cx + r, cy + r, rgb(238, 228, 206), rgb(78, 60, 42), scale_len(layout.width, 3));
+    for i in 0..12 {
+        let major = i % 3 == 0;
+        let inner = r - scale_len(layout.width, if major { 8 } else { 5 });
+        let (ix, iy) = polar(cx, cy, inner as f64, i as f64 * 30.0);
+        let (ox, oy) = polar(cx, cy, (r - scale_len(layout.width, 2)) as f64, i as f64 * 30.0);
+        draw_line(hdc, ix, iy, ox, oy, ink, scale_len(layout.width, if major { 2 } else { 1 }));
+    }
+    let (hx, hy) = polar(cx, cy, r as f64 * 0.5, hours / 12.0 * 360.0);
+    draw_line(hdc, cx, cy, hx, hy, rgb(30, 26, 22), scale_len(layout.width, 3));
+    let (mx, my) = polar(cx, cy, r as f64 * 0.74, minutes / 60.0 * 360.0);
+    draw_line(hdc, cx, cy, mx, my, rgb(30, 26, 22), scale_len(layout.width, 2));
+    let (sx2, sy2) = polar(cx, cy, r as f64 * 0.8, seconds / 60.0 * 360.0);
+    draw_line(hdc, cx, cy, sx2, sy2, rgb(176, 42, 34), scale_len(layout.width, 1));
+    let hub = scale_len(layout.width, 3);
+    fill_ellipse(hdc, cx - hub, cy - hub, cx + hub, cy + hub, rgb(30, 26, 22), rgb(30, 26, 22), 1);
+}
+
+/// Rectangle outline drawn as four lines (for the unit toggle buttons).
+#[cfg(windows)]
+fn draw_border(hdc: HDC, rect: RECT, color: COLORREF, width: i32) {
+    draw_line(hdc, rect.left, rect.top, rect.right, rect.top, color, width);
+    draw_line(hdc, rect.left, rect.bottom, rect.right, rect.bottom, color, width);
+    draw_line(hdc, rect.left, rect.top, rect.left, rect.bottom, color, width);
+    draw_line(hdc, rect.right, rect.top, rect.right, rect.bottom, color, width);
+}
+
+/// The NM / KM unit switch — the selected side is filled crimson with a gold
+/// border so the highlight tracks `units` (the art is drawn neutral underneath).
+#[cfg(windows)]
+fn draw_unit_toggle(hdc: HDC, layout: &Layout, units: Units) {
+    let nm = scale_rect(layout.width, layout.height, 1097, 22, 1161, 55);
+    let km = scale_rect(layout.width, layout.height, 1170, 22, 1234, 55);
+    draw_unit_button(hdc, layout, nm, "NM", units == Units::Imperial);
+    draw_unit_button(hdc, layout, km, "KM", units == Units::Metric);
+}
+
+#[cfg(windows)]
+fn draw_unit_button(hdc: HDC, layout: &Layout, rect: RECT, label: &str, selected: bool) {
+    if selected {
+        fill_rect(hdc, rect, rgb(122, 26, 20));
+        draw_line(hdc, rect.left, rect.top + scale_len(layout.width, 1), rect.right, rect.top + scale_len(layout.width, 1), rgb(178, 46, 36), scale_len(layout.width, 2));
+        draw_border(hdc, rect, rgb(198, 164, 86), scale_len(layout.width, 2));
+    } else {
+        fill_rect(hdc, rect, rgb(12, 24, 32));
+        draw_border(hdc, rect, rgb(46, 60, 68), scale_len(layout.width, 1));
+    }
+    let color = if selected { rgb(240, 232, 210) } else { rgb(150, 166, 175) };
+    draw_text(hdc, label, rect, layout.font(21), true, color, Align::Center);
 }
 
 /// Full text report panel shown on the RAW REPORT tab.
@@ -3528,44 +3888,23 @@ fn format_airport(airport: Option<&Map<String, Value>>) -> String {
     }
 }
 
-fn format_primary_route_for_ui(flightroute: Option<&Map<String, Value>>) -> String {
-    let Some(flightroute) = flightroute else {
-        return "Origin unknown -> destination unknown".to_string();
+/// Compact "KLAX → KSFO" route for the ROUTE panel, preferring ICAO codes (the
+/// K-prefixed style shown in the mock) and falling back to IATA.
+fn format_route_codes_for_ui(flightroute: Option<&Map<String, Value>>) -> String {
+    let code = |key: &str| -> Option<String> {
+        flightroute
+            .and_then(|route| route.get(key))
+            .and_then(Value::as_object)
+            .and_then(|airport| {
+                object_str(Some(airport), "icao_code")
+                    .or_else(|| object_str(Some(airport), "iata_code"))
+            })
     };
-    let origin = flightroute.get("origin").and_then(Value::as_object);
-    let destination = flightroute.get("destination").and_then(Value::as_object);
-    format!(
-        "{} -> {}",
-        short_airport_for_ui(origin),
-        short_airport_for_ui(destination)
-    )
-}
-
-fn format_route_detail_for_ui(flightroute: Option<&Map<String, Value>>) -> String {
-    let Some(flightroute) = flightroute else {
-        return "No route match found.".to_string();
-    };
-    let airline = flightroute.get("airline").and_then(Value::as_object);
-    format!(
-        "{}\n{}",
-        value_or_unknown_obj(airline, "name"),
-        format_primary_route_for_ui(Some(flightroute))
-    )
-}
-
-fn short_airport_for_ui(airport: Option<&Map<String, Value>>) -> String {
-    let Some(airport) = airport else {
-        return "unknown".to_string();
-    };
-    let code =
-        object_str(Some(airport), "iata_code").or_else(|| object_str(Some(airport), "icao_code"));
-    let name =
-        object_str(Some(airport), "municipality").or_else(|| object_str(Some(airport), "name"));
-    match (name, code) {
-        (Some(name), Some(code)) => format!("{name} ({code})"),
-        (Some(name), None) => name,
-        (None, Some(code)) => code,
-        (None, None) => "unknown".to_string(),
+    match (code("origin"), code("destination")) {
+        (Some(origin), Some(destination)) => format!("{origin} → {destination}"),
+        (Some(origin), None) => format!("{origin} → ?"),
+        (None, Some(destination)) => format!("? → {destination}"),
+        (None, None) => "—".to_string(),
     }
 }
 
