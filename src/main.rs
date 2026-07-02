@@ -3,7 +3,7 @@
 // terminal at startup (see `attach_parent_console`) so their output still shows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use clap::{Parser, ValueEnum};
 use reqwest::blocking::{Client, Response};
 use scraper::{Html, Selector};
@@ -42,16 +42,22 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT, UpdateWindow,
 };
 #[cfg(windows)]
+use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+#[cfg(windows)]
+use windows::Win32::UI::Controls::MARGINS;
+#[cfg(windows)]
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 #[cfg(windows)]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW,
     KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_MINIMIZE, SW_SHOW, SetTimer,
     ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_POPUP, WS_VISIBLE,
+    WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_PRINTCLIENT,
+    WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE,
 };
 #[cfg(windows)]
 use windows::core::{PCWSTR, w};
@@ -85,10 +91,27 @@ const DESIGN_HEIGHT: i32 = 941;
 const WINDOW_WIDTH: i32 = 1170;
 #[cfg(windows)]
 const WINDOW_HEIGHT: i32 = 659;
+// Undocumented messages Uxtheme/DWM send to force a caption/frame redraw
+// outside the normal WM_NCPAINT/WM_NCACTIVATE flow; left unhandled they can
+// paint a native titlebar over our borderless window regardless of the
+// WM_NCCALCSIZE/WM_NCACTIVATE handling below.
+#[cfg(windows)]
+const WM_NCUAHDRAWCAPTION: u32 = 0x00AE;
+#[cfg(windows)]
+const WM_NCUAHDRAWFRAME: u32 = 0x00AF;
 #[cfg(windows)]
 const AUTO_REFRESH_TIMER_ID: usize = 1;
 #[cfg(windows)]
 const AUTO_REFRESH_INTERVAL_MS: u32 = 20_000;
+#[cfg(windows)]
+const RADAR_ANIMATION_TIMER_ID: usize = 2;
+/// Redraw rate for extrapolated aircraft motion between OpenSky refreshes.
+#[cfg(windows)]
+const RADAR_ANIMATION_INTERVAL_MS: u32 = 100;
+/// Cap on how far a contact's last known speed/track is trusted to
+/// extrapolate before it's shown parked at its last reported position.
+#[cfg(windows)]
+const RADAR_EXTRAPOLATION_LIMIT_S: i64 = 90;
 #[cfg(windows)]
 const ASSET_BACKGROUND_PNG: &[u8] = include_bytes!("../assets/ui/mock-texture-background-70.png");
 #[cfg(windows)]
@@ -273,9 +296,8 @@ struct UiModel {
     operator: String,
     /// Compact airport codes for the ROUTE panel, e.g. "KLAX → KSFO".
     route_codes: String,
-    /// Scheduled departure / arrival strings if the route feed carries them.
-    departs: String,
-    arrives: String,
+    /// From/destination city pair, e.g. "Los Angeles → San Francisco".
+    route_cities: String,
     summary: String,
     altitude: String,
     heading: String,
@@ -294,7 +316,12 @@ struct UiModel {
 
 #[cfg(windows)]
 impl UiModel {
-    fn from_flight(_location: &Location, nearest: &NearestAircraft, units: Units) -> Self {
+    fn from_flight(
+        _location: &Location,
+        nearest: &NearestAircraft,
+        units: Units,
+        is_nearest: bool,
+    ) -> Self {
         let state = &nearest.state;
         let metadata = nearest.metadata.as_ref();
         let aircraft = nested_object(metadata, &["aircraft"]);
@@ -337,15 +364,11 @@ impl UiModel {
         let _ = units;
 
         let route_codes = format_route_codes_for_ui(flightroute);
-        let departs = flightroute
-            .and_then(|route| object_str(Some(route), "scheduled_departure"))
-            .unwrap_or_default();
-        let arrives = flightroute
-            .and_then(|route| object_str(Some(route), "scheduled_arrival"))
-            .unwrap_or_default();
+        let route_cities = format_route_cities_for_ui(flightroute);
         let (date, clock) = match nearest
             .api_time
             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+            .map(|time| time.with_timezone(&Local))
         {
             Some(time) => (
                 time.format("%d %b %Y").to_string().to_uppercase(),
@@ -362,9 +385,8 @@ impl UiModel {
             callsign,
             operator,
             route_codes,
-            departs,
-            arrives,
-            summary: ui_summary_card(nearest, units),
+            route_cities,
+            summary: ui_summary_card(nearest, units, is_nearest),
             altitude: ui_flight_level(state.baro_altitude),
             heading: ui_heading(state.true_track),
             registry,
@@ -886,7 +908,7 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
         let cursor = LoadCursorW(None, IDC_ARROW)
             .map_err(|error| FlightTrackerError(format!("could not load cursor: {error}")))?;
         let window_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
             lpfnWndProc: Some(dashboard_window_proc),
             hInstance: instance,
             hCursor: cursor,
@@ -896,7 +918,11 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
         RegisterClassW(&window_class);
 
         let title = to_wide("Flight Tracker");
-        let window_style = WS_POPUP | WS_VISIBLE;
+        // A real captioned/sizable style (rather than WS_POPUP) so DWM treats
+        // this as a normal top-level window and animates minimize/restore;
+        // WM_NCCALCSIZE below strips the drawn frame so it still looks
+        // borderless.
+        let window_style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
         let window_ex_style = WINDOW_EX_STYLE(0);
         let hwnd = CreateWindowExW(
             window_ex_style,
@@ -914,6 +940,20 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
         )
         .map_err(|error| FlightTrackerError(format!("could not create window: {error}")))?;
 
+        // Tells DWM this window has "some" composited frame even though the
+        // client area covers it entirely (WM_NCCALCSIZE above). Without this,
+        // DWM occasionally falls back to drawing its own native titlebar over
+        // ours during animations/thumbnails despite the message handling.
+        let _ = DwmExtendFrameIntoClientArea(
+            hwnd,
+            &MARGINS {
+                cxLeftWidth: 0,
+                cxRightWidth: 0,
+                cyTopHeight: 1,
+                cyBottomHeight: 0,
+            },
+        );
+
         let timer_id = SetTimer(
             Some(hwnd),
             AUTO_REFRESH_TIMER_ID,
@@ -925,6 +965,12 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
                 "could not start dashboard refresh timer".to_string(),
             ));
         }
+        let _ = SetTimer(
+            Some(hwnd),
+            RADAR_ANIMATION_TIMER_ID,
+            RADAR_ANIMATION_INTERVAL_MS,
+            None,
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
         apply_rounded_region(hwnd, WINDOW_WIDTH, WINDOW_HEIGHT);
         let _ = UpdateWindow(hwnd);
@@ -959,9 +1005,31 @@ extern "system" fn dashboard_window_proc(
                 paint_dashboard(hwnd);
                 LRESULT(0)
             }
+            // DWM sends this when it needs a bitmap of our content outside of
+            // normal painting (minimize/restore animation, taskbar/Alt-Tab
+            // thumbnails, Aero Peek). Without a handler it falls back to a
+            // generic titlebar-shaped placeholder instead of our real UI.
+            WM_PRINTCLIENT => {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                render_dashboard_into(hwnd, hdc);
+                LRESULT(0)
+            }
             // We repaint the whole client area from a back buffer, so suppress
             // the default background erase to avoid flicker.
             WM_ERASEBKGND => LRESULT(1),
+            // We have no nonclient area to redraw (WM_NCCALCSIZE below
+            // collapses it to zero), so skip the default caption repaint on
+            // activate/deactivate — passing lParam -1 tells DefWindowProc not
+            // to redraw the nonclient area, avoiding a caption-frame flash.
+            WM_NCACTIVATE => DefWindowProcW(hwnd, message, wparam, LPARAM(-1)),
+            // We have no nonclient area at all (see WM_NCCALCSIZE below), so
+            // never let the default handler paint one — covers stray
+            // WM_NCPAINT dispatches DWM sends outside the activate/animation
+            // paths already handled above.
+            WM_NCPAINT => LRESULT(0),
+            // Uxtheme/DWM-internal, not in the public message table; skip
+            // default handling entirely rather than let it draw a caption.
+            WM_NCUAHDRAWCAPTION | WM_NCUAHDRAWFRAME => LRESULT(0),
             WM_SIZE => {
                 let mut rect = RECT::default();
                 if GetClientRect(hwnd, &mut rect).is_ok() {
@@ -969,6 +1037,16 @@ extern "system" fn dashboard_window_proc(
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
+            }
+            // Collapse the non-client frame to zero so the real WS_CAPTION
+            // frame (kept for DWM's benefit — shadow, minimize/restore
+            // animation) never actually draws a titlebar/border.
+            WM_NCCALCSIZE => {
+                if wparam.0 != 0 {
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                }
             }
             WM_NCHITTEST => hit_test_frameless_window(hwnd, lparam),
             WM_LBUTTONDOWN => {
@@ -985,12 +1063,16 @@ extern "system" fn dashboard_window_proc(
                 if wparam.0 == AUTO_REFRESH_TIMER_ID {
                     refresh_dashboard(hwnd, false);
                     LRESULT(0)
+                } else if wparam.0 == RADAR_ANIMATION_TIMER_ID {
+                    animate_radar_tick(hwnd);
+                    LRESULT(0)
                 } else {
                     DefWindowProcW(hwnd, message, wparam, lparam)
                 }
             }
             WM_DESTROY => {
                 let _ = KillTimer(Some(hwnd), AUTO_REFRESH_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), RADAR_ANIMATION_TIMER_ID);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -1071,6 +1153,14 @@ fn handle_click(hwnd: HWND, x: i32, y: i32) {
                 }
                 hit = true;
                 break;
+            }
+        }
+        if !hit {
+            if let Some(index) = radar_hit_test(&layout, &state, x, y) {
+                if state.select(index) {
+                    enrich_index = Some(index);
+                }
+                hit = true;
             }
         }
         changed = hit;
@@ -1188,6 +1278,25 @@ fn enrich_selected_async(hwnd: HWND, index: usize) {
     });
 }
 
+/// Repaint on the fast animation timer so radar contacts visibly drift along
+/// their track between OpenSky refreshes. No interpolation state is kept —
+/// draw_radar recomputes each contact's extrapolated position from its own
+/// last-known speed/track against the wall clock on every tick.
+#[cfg(windows)]
+fn animate_radar_tick(hwnd: HWND) {
+    let Some(state_mutex) = UI_STATE.get() else {
+        return;
+    };
+    let Ok(state) = state_mutex.lock() else {
+        return;
+    };
+    if state.tab != Tab::Overview || state.aircraft.is_empty() {
+        return;
+    }
+    drop(state);
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+}
+
 #[cfg(windows)]
 fn refresh_dashboard(hwnd: HWND, show_status: bool) {
     let Some(state_mutex) = UI_STATE.get() else {
@@ -1259,10 +1368,12 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
     });
 }
 
+/// Render the dashboard into an arbitrary target HDC (the window's own DC on
+/// WM_PAINT, or a DC DWM hands us on WM_PRINTCLIENT so it has real content to
+/// composite into the minimize/restore animation and thumbnails instead of
+/// falling back to a generic titlebar placeholder).
 #[cfg(windows)]
-fn paint_dashboard(hwnd: HWND) {
-    let mut paint = PAINTSTRUCT::default();
-    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+fn render_dashboard_into(hwnd: HWND, hdc: HDC) {
     let mut rect = RECT::default();
     if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
         let width = (rect.right - rect.left).max(1);
@@ -1284,6 +1395,13 @@ fn paint_dashboard(hwnd: HWND) {
             let _ = DeleteDC(mem_dc);
         }
     }
+}
+
+#[cfg(windows)]
+fn paint_dashboard(hwnd: HWND) {
+    let mut paint = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+    render_dashboard_into(hwnd, hdc);
     let _ = unsafe { EndPaint(hwnd, &paint) };
 }
 
@@ -1300,9 +1418,9 @@ fn draw_dashboard(hdc: HDC, rect: RECT, state: &UiState) {
         draw_tab_state(hdc, &layout, state.tab);
         draw_unit_toggle(hdc, &layout, state.units);
 
-        let model = state
-            .selected_aircraft()
-            .map(|aircraft| UiModel::from_flight(&state.location, aircraft, state.units));
+        let model = state.selected_aircraft().map(|aircraft| {
+            UiModel::from_flight(&state.location, aircraft, state.units, state.selected == 0)
+        });
 
         let updated = match &model {
             Some(model) => compact_time(&model.updated),
@@ -1468,7 +1586,7 @@ fn row_view(aircraft: &NearestAircraft, units: Units) -> RowView {
 }
 
 #[cfg(windows)]
-fn ui_summary_card(nearest: &NearestAircraft, units: Units) -> String {
+fn ui_summary_card(nearest: &NearestAircraft, units: Units, is_nearest: bool) -> String {
     let callsign = nearest
         .state
         .callsign
@@ -1476,8 +1594,13 @@ fn ui_summary_card(nearest: &NearestAircraft, units: Units) -> String {
         .map(str::trim)
         .filter(|callsign| !callsign.is_empty())
         .unwrap_or("This aircraft");
+    let headline = if is_nearest {
+        format!("{callsign} is nearest aircraft.")
+    } else {
+        format!("{callsign}.")
+    };
     let mut lines = vec![
-        format!("{callsign} is nearest aircraft."),
+        headline,
         format!(
             "{} away {}.",
             ui_distance(nearest.distance_km, units),
@@ -1639,29 +1762,17 @@ fn draw_board(hdc: HDC, layout: &Layout, state: &UiState) {
     }
 }
 
+/// Shared radar scope geometry (centre and the pixel radius/distance span it
+/// covers) so click hit-testing agrees exactly with where draw_radar plots
+/// each contact.
 #[cfg(windows)]
-fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
+fn radar_scope(layout: &Layout, state: &UiState) -> (i32, i32, f64, f64) {
     let area = layout.radar;
-    let sx = |value: i32| layout.sx(value);
-    let sy = |value: i32| layout.sy(value);
-    let font = |size: i32| layout.font(size);
     let width = area.right - area.left;
     let height = area.bottom - area.top;
     let cx = area.left + width * 46 / 100;
     let cy = area.top + height * 53 / 100;
     let radius = width.min(height) * 47 / 100;
-    // Centre marker for the observer's own position.
-    fill_ellipse(
-        hdc,
-        cx - sx(4),
-        cy - sy(4),
-        cx + sx(4),
-        cy + sy(4),
-        rgb(236, 211, 161),
-        rgb(236, 211, 161),
-        scale_len(layout.width, 1),
-    );
-
     let usable = (radius as f64) * 0.86;
     // Scale the scope to the farthest displayed contact (not the whole search
     // radius) so nearby traffic spreads across the scope instead of collapsing
@@ -1674,6 +1785,58 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
         .fold(0.0_f64, f64::max)
         .max(1.0)
         * 1.15;
+    (cx, cy, usable, span)
+}
+
+/// Returns the aircraft list index whose radar marker sits under (x, y), if
+/// any preferring the selected contact when markers overlap, since it's the
+/// one drawn on top.
+#[cfg(windows)]
+fn radar_hit_test(layout: &Layout, state: &UiState, x: i32, y: i32) -> Option<usize> {
+    if !point_in(layout.radar, x, y) {
+        return None;
+    }
+    let (cx, cy, usable, span) = radar_scope(layout, state);
+    let count = state.aircraft.len().min(UI_LIST_LIMIT);
+    let hit_radius = layout.sx(16) as i64;
+    let now_unix = Utc::now().timestamp();
+    let mut order: Vec<usize> = Vec::with_capacity(count);
+    if state.selected < count {
+        order.push(state.selected);
+    }
+    order.extend((0..count).filter(|&idx| idx != state.selected));
+
+    for idx in order {
+        let (distance_km, bearing_degrees) = extrapolated_polar(&state.aircraft[idx], now_unix);
+        let (px, py) = radar_point(cx, cy, usable, span, distance_km, bearing_degrees);
+        let dx = (x - px) as i64;
+        let dy = (y - py) as i64;
+        if dx * dx + dy * dy <= hit_radius * hit_radius {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
+    let sx = |value: i32| layout.sx(value);
+    let sy = |value: i32| layout.sy(value);
+    let font = |size: i32| layout.font(size);
+    let (cx, cy, usable, span) = radar_scope(layout, state);
+    let now_unix = Utc::now().timestamp();
+    // Centre marker for the observer's own position.
+    fill_ellipse(
+        hdc,
+        cx - sx(4),
+        cy - sy(4),
+        cx + sx(4),
+        cy + sy(4),
+        rgb(236, 211, 161),
+        rgb(236, 211, 161),
+        scale_len(layout.width, 1),
+    );
+
     let count = state.aircraft.len().min(UI_LIST_LIMIT);
     // Plot non-selected contacts first so the selected one paints on top.
     for idx in 0..count {
@@ -1681,12 +1844,13 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
             continue;
         }
         let aircraft = &state.aircraft[idx];
-        let (bx, by) = radar_point(cx, cy, usable, span, aircraft);
+        let (distance_km, bearing_degrees) = extrapolated_polar(aircraft, now_unix);
+        let (bx, by) = radar_point(cx, cy, usable, span, distance_km, bearing_degrees);
         draw_plane_marker(
             hdc,
             bx,
             by,
-            sx(8),
+            sx(12),
             aircraft.state.true_track,
             rgb(120, 196, 224),
             rgb(40, 92, 112),
@@ -1694,7 +1858,8 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
     }
 
     if let Some(aircraft) = state.aircraft.get(state.selected) {
-        let (tx, ty) = radar_point(cx, cy, usable, span, aircraft);
+        let (distance_km, bearing_degrees) = extrapolated_polar(aircraft, now_unix);
+        let (tx, ty) = radar_point(cx, cy, usable, span, distance_km, bearing_degrees);
         draw_line(
             hdc,
             cx,
@@ -1704,13 +1869,13 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
             rgb(240, 190, 36),
             scale_len(layout.width, 2),
         );
-        draw_target_brackets(hdc, tx, ty, sx(23), rgb(240, 190, 36), layout.width);
+        draw_target_brackets(hdc, tx, ty, sx(26), rgb(240, 190, 36), layout.width);
         fill_ellipse(
             hdc,
-            tx - sx(16),
-            ty - sy(16),
-            tx + sx(16),
-            ty + sy(16),
+            tx - sx(19),
+            ty - sy(19),
+            tx + sx(19),
+            ty + sy(19),
             rgb(99, 35, 26),
             rgb(240, 190, 36),
             scale_len(layout.width, 2),
@@ -1719,7 +1884,7 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
             hdc,
             tx,
             ty,
-            sx(9),
+            sx(14),
             aircraft.state.true_track,
             rgb(255, 225, 138),
             rgb(120, 70, 20),
@@ -1736,8 +1901,8 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
             &format!(
                 "{}\n{}  {}\n{}",
                 callsign,
-                ui_distance(aircraft.distance_km, state.units),
-                compass16(aircraft.bearing_degrees),
+                ui_distance(distance_km, state.units),
+                compass16(bearing_degrees),
                 ui_flight_level(aircraft.state.baro_altitude)
             ),
             rect_xy(tx + sx(22), ty - sy(14), tx + sx(168), ty + sy(70)),
@@ -1750,17 +1915,54 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
 
 }
 
-/// Project an aircraft's bearing/distance onto the radar scope (North up).
+/// Extrapolate a contact's observer-relative distance/bearing forward to
+/// `now` using its last known ground speed and track, so the radar shows it
+/// drifting along its heading between OpenSky refreshes instead of jumping
+/// once every refresh. A flat-plane projection is accurate enough at the
+/// ranges (typically well under 200 km) and extrapolation windows (capped at
+/// `RADAR_EXTRAPOLATION_LIMIT_S`) involved here.
+#[cfg(windows)]
+fn extrapolated_polar(aircraft: &NearestAircraft, now_unix: i64) -> (f64, f64) {
+    let (Some(speed_mps), Some(track_deg)) = (aircraft.state.velocity, aircraft.state.true_track)
+    else {
+        return (aircraft.distance_km, aircraft.bearing_degrees);
+    };
+    let reference = aircraft
+        .state
+        .time_position
+        .or(aircraft.api_time)
+        .unwrap_or(now_unix);
+    let elapsed_s = (now_unix - reference).clamp(0, RADAR_EXTRAPOLATION_LIMIT_S) as f64;
+    if elapsed_s <= 0.0 || speed_mps <= 0.0 {
+        return (aircraft.distance_km, aircraft.bearing_degrees);
+    }
+
+    let bearing_rad = aircraft.bearing_degrees.to_radians();
+    let mut east_km = aircraft.distance_km * bearing_rad.sin();
+    let mut north_km = aircraft.distance_km * bearing_rad.cos();
+
+    let track_rad = track_deg.to_radians();
+    let travelled_km = speed_mps * elapsed_s / 1000.0;
+    east_km += travelled_km * track_rad.sin();
+    north_km += travelled_km * track_rad.cos();
+
+    let distance_km = east_km.hypot(north_km);
+    let bearing_degrees = east_km.atan2(north_km).to_degrees().rem_euclid(360.0);
+    (distance_km, bearing_degrees)
+}
+
+/// Project a bearing/distance onto the radar scope (North up).
 #[cfg(windows)]
 fn radar_point(
     cx: i32,
     cy: i32,
     usable: f64,
     span_km: f64,
-    aircraft: &NearestAircraft,
+    distance_km: f64,
+    bearing_degrees: f64,
 ) -> (i32, i32) {
-    let r = usable * (aircraft.distance_km / span_km).clamp(0.0, 1.0);
-    let angle = (aircraft.bearing_degrees - 90.0).to_radians();
+    let r = usable * (distance_km / span_km).clamp(0.0, 1.0);
+    let angle = (bearing_degrees - 90.0).to_radians();
     (cx + (angle.cos() * r) as i32, cy + (angle.sin() * r) as i32)
 }
 
@@ -1838,8 +2040,8 @@ fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status
         rgb(113, 25, 23),
         Align::Left,
     );
-    // ROUTE — compact airport codes like the mock ("KLAX → KSFO"); scheduled
-    // times sit under the baked Departs/Arrives labels when the feed has them.
+    // ROUTE — compact airport codes like the mock ("KLAX → KSFO"), with the
+    // from/destination city pair underneath in a smaller typeface.
     draw_text(
         hdc,
         &model.route_codes,
@@ -1849,26 +2051,15 @@ fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status
         rgb(22, 33, 38),
         Align::Center,
     );
-    if !model.departs.is_empty() {
+    if !model.route_cities.is_empty() {
         draw_text(
             hdc,
-            &model.departs,
-            scale_rect(layout.width, layout.height, 658, 820, 752, 850),
-            layout.font(16),
-            true,
-            rgb(22, 33, 38),
-            Align::Left,
-        );
-    }
-    if !model.arrives.is_empty() {
-        draw_text(
-            hdc,
-            &model.arrives,
-            scale_rect(layout.width, layout.height, 756, 820, 852, 850),
-            layout.font(16),
-            true,
-            rgb(22, 33, 38),
-            Align::Left,
+            &model.route_cities,
+            scale_rect(layout.width, layout.height, 656, 800, 852, 824),
+            layout.font(14),
+            false,
+            rgb(96, 82, 68),
+            Align::Center,
         );
     }
     draw_text(
@@ -3908,12 +4099,29 @@ fn format_route_codes_for_ui(flightroute: Option<&Map<String, Value>>) -> String
     }
 }
 
+/// City pair for the ROUTE panel ("Los Angeles → San Francisco"), shown under
+/// the airport codes in place of the (rarely populated) scheduled times.
+fn format_route_cities_for_ui(flightroute: Option<&Map<String, Value>>) -> String {
+    let city = |key: &str| -> Option<String> {
+        flightroute
+            .and_then(|route| route.get(key))
+            .and_then(Value::as_object)
+            .and_then(|airport| object_str(Some(airport), "municipality"))
+    };
+    match (city("origin"), city("destination")) {
+        (Some(origin), Some(destination)) => format!("{origin} → {destination}"),
+        (Some(origin), None) => origin,
+        (None, Some(destination)) => destination,
+        (None, None) => String::new(),
+    }
+}
+
 fn compact_time(value: &str) -> String {
     value
         .split('T')
         .nth(1)
         .and_then(|time| time.get(0..8))
-        .map(|time| format!("{time} Z"))
+        .map(|time| format!("{time} LT"))
         .unwrap_or_else(|| value.to_string())
 }
 
@@ -3943,7 +4151,7 @@ fn format_timestamp(value: Option<i64>) -> String {
         return "unknown".to_string();
     };
     DateTime::<Utc>::from_timestamp(value, 0)
-        .map(|timestamp| timestamp.to_rfc3339())
+        .map(|timestamp| timestamp.with_timezone(&Local).to_rfc3339())
         .unwrap_or_else(|| "unknown".to_string())
 }
 

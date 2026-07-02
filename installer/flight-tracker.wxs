@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v3 source for the Flight Tracker Windows-on-ARM (ARM64) installer.
+  Build it with the standalone WiX v3.14 binaries (candle then light); see
+  installer/build-installer.ps1 for the exact commands. The ExeSource variable
+  is passed in on the candle command line so this file stays independent of the
+  build output path.
+
+  Produces a per-machine MSI that installs flight-tracker.exe into
+  "C:\Program Files\Flight Tracker" and adds Start Menu and Desktop shortcuts
+  that launch the dashboard.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Flight Tracker"
+           Language="1033"
+           Version="0.1.2.0"
+           Manufacturer="Rob Righter"
+           UpgradeCode="9AF56B5D-C0A3-465D-B1C3-34E96F60C126">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="arm64"
+             Manufacturer="Rob Righter"
+             Description="Flight Tracker - nearest-aircraft ops board" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Flight Tracker is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Shown in Add/Remove Programs. -->
+    <Property Id="ARPCOMMENTS" Value="Find and track the nearest aircraft to your location." />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/robrighter/flight-tracker" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <Feature Id="MainFeature" Title="Flight Tracker" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Flight Tracker" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <!-- The application executable (self-contained; assets are baked in). -->
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="*">
+        <File Id="FlightTrackerExe"
+              Name="flight-tracker.exe"
+              Source="$(var.ExeSource)"
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Start Menu shortcut; launches the dashboard UI. -->
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="StartMenuFlightTracker"
+                  Name="Flight Tracker"
+                  Description="Nearest-aircraft ops board"
+                  Target="[INSTALLFOLDER]flight-tracker.exe"
+                  Arguments="--ui --radius-km 200"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Rob Righter\Flight Tracker"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Desktop shortcut; also launches the dashboard UI. -->
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut Id="DesktopFlightTracker"
+                  Name="Flight Tracker"
+                  Description="Nearest-aircraft ops board"
+                  Target="[INSTALLFOLDER]flight-tracker.exe"
+                  Arguments="--ui --radius-km 200"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Rob Righter\Flight Tracker"
+                       Name="desktop"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Minimal install-directory UI (welcome, folder chooser, progress). -->
+    <UIRef Id="WixUI_InstallDir" />
+  </Product>
+</Wix>
