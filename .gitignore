@@ -1,33 +1,8 @@
-# Python bytecode and caches
-__pycache__/
-*.py[cod]
-*$py.class
-
 # Build and packaging artifacts
 build/
 dist/
 target/
-*.egg-info/
-*.egg
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Test and coverage output
-.pytest_cache/
-.coverage
-coverage.xml
-htmlcov/
-
-# Type checker and tooling caches
-.mypy_cache/
-.ruff_cache/
-.pyre/
-.tox/
-.nox/
+packaging/layout/
 
 # Local environment/configuration
 .env

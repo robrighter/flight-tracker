@@ -10,6 +10,10 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::collections::HashMap;
+#[cfg(windows)]
+use std::cell::RefCell;
 use std::env;
 use std::fmt::{self, Display};
 use std::io::Read;
@@ -36,7 +40,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, EndPaint, FF_DONTCARE, FW_BOLD, FW_NORMAL, FillRect,
-    GetStockObject, HDC, HGDIOBJ, HOLLOW_BRUSH, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS,
+    GetStockObject, HDC, HFONT, HGDIOBJ, HOLLOW_BRUSH, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, PS_SOLID, Polygon,
     RGBQUAD, SRCCOPY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
     TRANSPARENT, UpdateWindow,
@@ -107,7 +111,7 @@ const AUTO_REFRESH_INTERVAL_MS: u32 = 20_000;
 const RADAR_ANIMATION_TIMER_ID: usize = 2;
 /// Redraw rate for extrapolated aircraft motion between OpenSky refreshes.
 #[cfg(windows)]
-const RADAR_ANIMATION_INTERVAL_MS: u32 = 100;
+const RADAR_ANIMATION_INTERVAL_MS: u32 = 50;
 /// Cap on how far a contact's last known speed/track is trusted to
 /// extrapolate before it's shown parked at its last reported position.
 #[cfg(windows)]
@@ -308,10 +312,6 @@ struct UiModel {
     track_deg: Option<f64>,
     speed_kt: Option<f64>,
     vertical_fpm: Option<f64>,
-    /// UPDATED panel: date line ("20 MAY 2025") and clock-hand positions
-    /// (hour in [0,12), minute in [0,60), second in [0,60)).
-    date: String,
-    clock: Option<(f64, f64, f64)>,
 }
 
 #[cfg(windows)]
@@ -365,21 +365,6 @@ impl UiModel {
 
         let route_codes = format_route_codes_for_ui(flightroute);
         let route_cities = format_route_cities_for_ui(flightroute);
-        let (date, clock) = match nearest
-            .api_time
-            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
-            .map(|time| time.with_timezone(&Local))
-        {
-            Some(time) => (
-                time.format("%d %b %Y").to_string().to_uppercase(),
-                Some((
-                    (time.hour() % 12) as f64 + time.minute() as f64 / 60.0,
-                    time.minute() as f64 + time.second() as f64 / 60.0,
-                    time.second() as f64,
-                )),
-            ),
-            None => (String::new(), None),
-        };
 
         Self {
             callsign,
@@ -395,8 +380,6 @@ impl UiModel {
             track_deg: state.true_track,
             speed_kt: state.velocity.map(|mps| mps * MPS_TO_KNOTS),
             vertical_fpm: state.vertical_rate.map(|mps| mps * M_TO_FEET * 60.0),
-            date,
-            clock,
         }
     }
 }
@@ -557,11 +540,41 @@ impl UiState {
         self.rebuild_report();
     }
 
+    /// Concatenates a full report for every contact currently on the radar
+    /// (not just the selected one), each under its own banner so the raw
+    /// report tab is a complete dump of everything shown on screen.
     fn rebuild_report(&mut self) {
-        self.report = match self.selected_aircraft() {
-            Some(aircraft) => build_report(&self.location, aircraft, self.radius_km, self.units),
-            None => "No aircraft in range.".to_string(),
-        };
+        if self.aircraft.is_empty() {
+            self.report = "No aircraft in range.".to_string();
+            return;
+        }
+        let count = self.aircraft.len().min(UI_LIST_LIMIT);
+        let mut report = String::new();
+        for (index, aircraft) in self.aircraft.iter().take(count).enumerate() {
+            if index > 0 {
+                report.push('\n');
+            }
+            let callsign = aircraft
+                .state
+                .callsign
+                .as_deref()
+                .map(str::trim)
+                .filter(|callsign| !callsign.is_empty())
+                .unwrap_or("NO CALLSIGN");
+            let marker = if index == self.selected { "> " } else { "  " };
+            pushln(
+                &mut report,
+                &format!("{marker}CONTACT {} OF {count} \u{2014} {callsign}", index + 1),
+            );
+            pushln(&mut report, &"=".repeat(60));
+            report.push_str(&build_report(
+                &self.location,
+                aircraft,
+                self.radius_km,
+                self.units,
+            ));
+        }
+        self.report = report;
     }
 
     /// Re-query OpenSky for the current location and rebuild the contact list.
@@ -591,17 +604,18 @@ impl UiState {
 /// binary is built for the Windows GUI subsystem (no auto-allocated console),
 /// this is what lets CLI output appear when the tool is run from a shell, while
 /// a double-click / `Start-Process` launch of the dashboard shows no terminal.
+/// Returns whether a console was actually attached.
 #[cfg(windows)]
-fn attach_parent_console() {
-    unsafe {
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
+fn attach_parent_console() -> bool {
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS).is_ok() }
 }
 
 fn main() -> ExitCode {
     #[cfg(windows)]
-    attach_parent_console();
-    match run() {
+    let console_attached = attach_parent_console();
+    #[cfg(not(windows))]
+    let console_attached = true;
+    match run(console_attached) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -610,8 +624,20 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> AppResult<()> {
-    let args = Cli::parse();
+fn run(console_attached: bool) -> AppResult<()> {
+    let mut args = Cli::parse();
+
+    // A launch with zero arguments AND no attached console only happens via a
+    // Start Menu tile, desktop shortcut, or double-click in Explorer — e.g.
+    // the MSIX package's AppsFolder entry, which (unlike a .lnk shortcut's
+    // Arguments field) has no way to bake in a default `--ui`. Without this,
+    // that launch path silently runs the CLI text-report branch with nowhere
+    // to print its output, and the process just exits a moment later looking
+    // like a crash. A terminal user running the same bare command keeps the
+    // documented CLI behavior, since they do have a console attached.
+    if !console_attached && env::args().count() <= 1 {
+        args.ui = true;
+    }
 
     if args.show_settings {
         return show_settings();
@@ -636,18 +662,37 @@ fn run() -> AppResult<()> {
             ));
         }
         let client = ApiClient::new(args.timeout)?;
-        let mut location = resolve_location(&args, &client)?;
+        // A location failure (Windows Location API denied/timed out and no
+        // saved fallback) must never prevent the dashboard window itself from
+        // appearing — bailing out here with `?` would exit the process with
+        // nothing visible, which is especially bad for a packaged app with no
+        // attached console to show the error on (e.g. a Store certification
+        // reviewer's test device with no location configured). Show the
+        // window with a status explaining what's wrong instead.
+        let location_result = resolve_location(&args, &client);
+        let location_failed = location_result.is_err();
+        let mut location = location_result.unwrap_or_else(|error| Location {
+            latitude: 0.0,
+            longitude: 0.0,
+            label: error.to_string(),
+            source: "none".to_string(),
+        });
         // Give the observer's own location a human-readable city label for the
         // status bar (Windows/CLI labels are generic); keep coords on failure.
-        if let Some(place) = reverse_geocode(location.latitude, location.longitude, &client) {
-            location.label = match (place.city, place.region) {
-                (Some(city), Some(region)) => format!("{city}, {region}"),
-                (Some(city), None) => city,
-                _ => place.label,
-            };
+        if !location_failed {
+            if let Some(place) = reverse_geocode(location.latitude, location.longitude, &client) {
+                location.label = match (place.city, place.region) {
+                    (Some(city), Some(region)) => format!("{city}, {region}"),
+                    (Some(city), None) => city,
+                    _ => place.label,
+                };
+            }
         }
         let aircraft = Vec::new();
-        let state = UiState::new(client, location, args.radius_km, args.units, aircraft);
+        let mut state = UiState::new(client, location, args.radius_km, args.units, aircraft);
+        if location_failed {
+            state.status = "NO LOCATION \u{2014} use --set-location".to_string();
+        }
         return run_dashboard_window(state);
     }
 
@@ -688,7 +733,7 @@ fn resolve_location(args: &Cli, _client: &ApiClient) -> AppResult<Location> {
             "--lat and --lon must be provided together".to_string(),
         )),
         (None, None) => {
-            if let Ok(location) = resolve_windows_location(args.timeout) {
+            if let Ok(location) = resolve_windows_location_bounded(args.timeout) {
                 return Ok(location);
             }
 
@@ -1302,7 +1347,7 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
     let Some(state_mutex) = UI_STATE.get() else {
         return;
     };
-    let (client, location, radius_km) = {
+    let (client, location, radius_km, selected_icao24) = {
         let Ok(mut state) = state_mutex.lock() else {
             return;
         };
@@ -1313,10 +1358,14 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
         if show_status {
             state.status = "REFRESHING".to_string();
         }
+        let selected_icao24 = state
+            .selected_aircraft()
+            .and_then(|aircraft| aircraft.state.icao24.clone());
         (
             state.client.clone(),
             state.location.clone(),
             state.radius_km,
+            selected_icao24,
         )
     };
 
@@ -1333,11 +1382,22 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
                 for aircraft in &mut aircraft {
                     enrich_aircraft_table_details(aircraft, &client);
                 }
-                if let Some(selected) = aircraft.get_mut(0) {
+                // Keep the same contact highlighted across refreshes when it's
+                // still in range, even if it moved within the (distance-sorted)
+                // list; otherwise fall back to the nearest contact.
+                let selected_index = selected_icao24
+                    .as_deref()
+                    .and_then(|icao24| {
+                        aircraft
+                            .iter()
+                            .position(|candidate| candidate.state.icao24.as_deref() == Some(icao24))
+                    })
+                    .unwrap_or(0);
+                if let Some(selected) = aircraft.get_mut(selected_index) {
                     enrich_aircraft(selected, &client);
-                    enriched[0] = true;
+                    enriched[selected_index] = true;
                 }
-                Ok(Some((aircraft, enriched)))
+                Ok(Some((aircraft, enriched, selected_index)))
             }
             Ok(_) => Ok(None),
             Err(error) => Err(error),
@@ -1345,10 +1405,10 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
         if let Some(state_mutex) = UI_STATE.get() {
             if let Ok(mut state) = state_mutex.lock() {
                 match result {
-                    Ok(Some((aircraft, enriched))) => {
+                    Ok(Some((aircraft, enriched, selected_index))) => {
                         state.aircraft = aircraft;
                         state.enriched = enriched;
-                        state.selected = 0;
+                        state.selected = selected_index;
                         state.raw_scroll_lines = 0;
                         state.status = "LIVE ADS-B".to_string();
                         state.rebuild_report();
@@ -1799,7 +1859,7 @@ fn radar_hit_test(layout: &Layout, state: &UiState, x: i32, y: i32) -> Option<us
     let (cx, cy, usable, span) = radar_scope(layout, state);
     let count = state.aircraft.len().min(UI_LIST_LIMIT);
     let hit_radius = layout.sx(16) as i64;
-    let now_unix = Utc::now().timestamp();
+    let now_secs = Utc::now().timestamp_millis() as f64 / 1000.0;
     let mut order: Vec<usize> = Vec::with_capacity(count);
     if state.selected < count {
         order.push(state.selected);
@@ -1807,7 +1867,7 @@ fn radar_hit_test(layout: &Layout, state: &UiState, x: i32, y: i32) -> Option<us
     order.extend((0..count).filter(|&idx| idx != state.selected));
 
     for idx in order {
-        let (distance_km, bearing_degrees) = extrapolated_polar(&state.aircraft[idx], now_unix);
+        let (distance_km, bearing_degrees) = extrapolated_polar(&state.aircraft[idx], now_secs);
         let (px, py) = radar_point(cx, cy, usable, span, distance_km, bearing_degrees);
         let dx = (x - px) as i64;
         let dy = (y - py) as i64;
@@ -1824,7 +1884,7 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
     let sy = |value: i32| layout.sy(value);
     let font = |size: i32| layout.font(size);
     let (cx, cy, usable, span) = radar_scope(layout, state);
-    let now_unix = Utc::now().timestamp();
+    let now_secs = Utc::now().timestamp_millis() as f64 / 1000.0;
     // Centre marker for the observer's own position.
     fill_ellipse(
         hdc,
@@ -1844,7 +1904,7 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
             continue;
         }
         let aircraft = &state.aircraft[idx];
-        let (distance_km, bearing_degrees) = extrapolated_polar(aircraft, now_unix);
+        let (distance_km, bearing_degrees) = extrapolated_polar(aircraft, now_secs);
         let (bx, by) = radar_point(cx, cy, usable, span, distance_km, bearing_degrees);
         draw_plane_marker(
             hdc,
@@ -1858,7 +1918,7 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
     }
 
     if let Some(aircraft) = state.aircraft.get(state.selected) {
-        let (distance_km, bearing_degrees) = extrapolated_polar(aircraft, now_unix);
+        let (distance_km, bearing_degrees) = extrapolated_polar(aircraft, now_secs);
         let (tx, ty) = radar_point(cx, cy, usable, span, distance_km, bearing_degrees);
         draw_line(
             hdc,
@@ -1921,8 +1981,13 @@ fn draw_radar(hdc: HDC, layout: &Layout, state: &UiState) {
 /// once every refresh. A flat-plane projection is accurate enough at the
 /// ranges (typically well under 200 km) and extrapolation windows (capped at
 /// `RADAR_EXTRAPOLATION_LIMIT_S`) involved here.
+///
+/// `now_secs` must carry sub-second precision (fractional seconds since the
+/// epoch) — this used to be a whole-second `i64` timestamp, which made the
+/// extrapolated position only change once per real second (in lockstep with
+/// a clock's second hand) no matter how often the radar redraws.
 #[cfg(windows)]
-fn extrapolated_polar(aircraft: &NearestAircraft, now_unix: i64) -> (f64, f64) {
+fn extrapolated_polar(aircraft: &NearestAircraft, now_secs: f64) -> (f64, f64) {
     let (Some(speed_mps), Some(track_deg)) = (aircraft.state.velocity, aircraft.state.true_track)
     else {
         return (aircraft.distance_km, aircraft.bearing_degrees);
@@ -1931,8 +1996,8 @@ fn extrapolated_polar(aircraft: &NearestAircraft, now_unix: i64) -> (f64, f64) {
         .state
         .time_position
         .or(aircraft.api_time)
-        .unwrap_or(now_unix);
-    let elapsed_s = (now_unix - reference).clamp(0, RADAR_EXTRAPOLATION_LIMIT_S) as f64;
+        .unwrap_or(now_secs as i64) as f64;
+    let elapsed_s = (now_secs - reference).clamp(0.0, RADAR_EXTRAPOLATION_LIMIT_S as f64);
     if elapsed_s <= 0.0 || speed_mps <= 0.0 {
         return (aircraft.distance_km, aircraft.bearing_degrees);
     }
@@ -2086,13 +2151,32 @@ fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status
     draw_speed_gauge(hdc, layout, 1207, 767, 39, model.speed_kt);
     draw_motion_readout(hdc, layout, model);
 
-    // UPDATED — analog clock + timestamp + date, like the mock.
-    if let Some((hours, minutes, seconds)) = model.clock {
-        draw_clock(hdc, layout, 1451, 784, 44, hours, minutes, seconds);
-    }
+    // TIME — a live clock (ticks every second, independent of the data
+    // refresh cycle); the title bar's UPDATED readout still shows the last
+    // OpenSky fetch time if that's what you're after.
+    let now = Local::now();
+    draw_clock(
+        hdc,
+        layout,
+        1451,
+        784,
+        44,
+        (now.hour() % 12) as f64 + now.minute() as f64 / 60.0,
+        now.minute() as f64 + now.second() as f64 / 60.0,
+        now.second() as f64,
+    );
     draw_text(
         hdc,
-        &compact_time(&model.updated),
+        "TIME",
+        scale_rect(layout.width, layout.height, 1508, 700, 1650, 726),
+        layout.font(20),
+        true,
+        rgb(0, 0, 0),
+        Align::Left,
+    );
+    draw_text(
+        hdc,
+        &format!("{} LT", now.format("%H:%M:%S")),
         scale_rect(layout.width, layout.height, 1508, 752, 1650, 794),
         layout.font(27),
         true,
@@ -2101,7 +2185,7 @@ fn draw_bottom_panels(hdc: HDC, layout: &Layout, model: Option<&UiModel>, status
     );
     draw_text(
         hdc,
-        &model.date,
+        &now.format("%d %b %Y").to_string().to_uppercase(),
         scale_rect(layout.width, layout.height, 1508, 800, 1650, 830),
         layout.font(19),
         true,
@@ -2435,7 +2519,7 @@ fn draw_raw_report(hdc: HDC, layout: &Layout, report: &str, scroll_lines: usize)
         rgb(151, 114, 61),
         scale_len(layout.width, 1),
     );
-    draw_mono_text(hdc, &visible_report, body, layout.font(15), rgb(28, 36, 38));
+    draw_mono_text(hdc, &visible_report, body, layout.font(19), rgb(28, 36, 38));
     draw_raw_scrollbar(hdc, layout, body, scroll_lines, max_scroll);
 }
 
@@ -2451,7 +2535,7 @@ fn raw_report_max_scroll_lines(layout: &Layout, report: &str) -> usize {
 
 #[cfg(windows)]
 fn raw_report_line_height(layout: &Layout) -> i32 {
-    layout.font(15) + layout.sy(5).max(3)
+    layout.font(19) + layout.sy(5).max(3)
 }
 
 #[cfg(windows)]
@@ -2780,6 +2864,53 @@ fn fill_rect(hdc: HDC, rect: RECT, color: COLORREF) {
     }
 }
 
+/// Reuses GDI font objects across repaints instead of creating/deleting one
+/// on every single draw_text/draw_mono_text call. With the radar animation
+/// repainting the whole dashboard tens of times a second, the CreateFontW
+/// churn from ~30+ text draws per frame was the actual bottleneck behind
+/// visible motion looking far choppier than the redraw timer alone implies.
+/// Painting only ever happens on the UI thread, so a thread-local cache
+/// needs no locking. Fonts are never explicitly freed — the distinct
+/// (face, size, bold) combinations used by this UI are small and bounded,
+/// so leaking a handful of GDI handles for the process lifetime is fine.
+#[cfg(windows)]
+fn cached_font(face: &str, size: i32, bold: bool) -> HFONT {
+    thread_local! {
+        static CACHE: RefCell<HashMap<(String, i32, bool), HFONT>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        let key = (face.to_string(), size, bold);
+        if let Some(&font) = cache.borrow().get(&key) {
+            return font;
+        }
+        let wide = to_wide(face);
+        let font = unsafe {
+            CreateFontW(
+                -size,
+                0,
+                0,
+                0,
+                if bold {
+                    FW_BOLD.0 as i32
+                } else {
+                    FW_NORMAL.0 as i32
+                },
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                PCWSTR(wide.as_ptr()),
+            )
+        };
+        cache.borrow_mut().insert(key, font);
+        font
+    })
+}
+
 #[cfg(windows)]
 fn draw_text(
     hdc: HDC,
@@ -2791,27 +2922,7 @@ fn draw_text(
     align: Align,
 ) {
     unsafe {
-        let face = to_wide("Bahnschrift");
-        let font = CreateFontW(
-            -size,
-            0,
-            0,
-            0,
-            if bold {
-                FW_BOLD.0 as i32
-            } else {
-                FW_NORMAL.0 as i32
-            },
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR(face.as_ptr()),
-        );
+        let font = cached_font("Bahnschrift", size, bold);
         let old_font = SelectObject(hdc, HGDIOBJ::from(font));
         let _ = SetTextColor(hdc, color);
         let format = match align {
@@ -2830,7 +2941,6 @@ fn draw_text(
         let mut wide = text.encode_utf16().collect::<Vec<u16>>();
         let _ = DrawTextW(hdc, &mut wide, &mut rect, format);
         let _ = SelectObject(hdc, old_font);
-        let _ = DeleteObject(HGDIOBJ::from(font));
     }
 }
 
@@ -2838,23 +2948,7 @@ fn draw_text(
 #[cfg(windows)]
 fn draw_mono_text(hdc: HDC, text: &str, mut rect: RECT, size: i32, color: COLORREF) {
     unsafe {
-        let face = to_wide("Consolas");
-        let font = CreateFontW(
-            -size,
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR(face.as_ptr()),
-        );
+        let font = cached_font("Consolas", size, false);
         let old_font = SelectObject(hdc, HGDIOBJ::from(font));
         let _ = SetTextColor(hdc, color);
         let format = windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
@@ -2863,7 +2957,6 @@ fn draw_mono_text(hdc: HDC, text: &str, mut rect: RECT, size: i32, color: COLORR
         let mut wide = text.encode_utf16().collect::<Vec<u16>>();
         let _ = DrawTextW(hdc, &mut wide, &mut rect, format);
         let _ = SelectObject(hdc, old_font);
-        let _ = DeleteObject(HGDIOBJ::from(font));
     }
 }
 
@@ -3018,6 +3111,34 @@ fn resolve_windows_location(_timeout_seconds: f64) -> AppResult<Location> {
     Err(FlightTrackerError(
         "Windows Location API is only available on Windows".to_string(),
     ))
+}
+
+/// Runs the Windows Location API call on a background thread with a hard
+/// wall-clock timeout enforced from the outside, independent of whatever the
+/// WinRT call itself is doing. A packaged (MSIX) app's first use of location
+/// can trigger an OS-level consent prompt; if that never gets answered (no
+/// interactive user present, notifications suppressed, etc.), the WinRT call
+/// can block far longer than its own internal timeout parameter suggests —
+/// this wrapper guarantees resolve_location still reaches its fallback/error
+/// handling instead of leaving the dashboard window never created.
+#[cfg(windows)]
+fn resolve_windows_location_bounded(timeout_seconds: f64) -> AppResult<Location> {
+    let timeout_seconds = timeout_seconds.clamp(1.0, 60.0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(resolve_windows_location(timeout_seconds));
+    });
+    match rx.recv_timeout(Duration::from_secs_f64(timeout_seconds + 5.0)) {
+        Ok(result) => result,
+        Err(_) => Err(FlightTrackerError(
+            "Windows Location API did not respond in time".to_string(),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_windows_location_bounded(timeout_seconds: f64) -> AppResult<Location> {
+    resolve_windows_location(timeout_seconds)
 }
 
 #[cfg(windows)]
@@ -3187,10 +3308,7 @@ fn reverse_geocode(latitude: f64, longitude: f64, client: &ApiClient) -> Option<
         ],
     );
     let region = first_present(address, &["state", "region", "state_district", "county"]);
-    let country = address
-        .get("country")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let country = address.get("country").and_then(Value::as_str).map(safe_display);
     let fallback = data.get("display_name").and_then(Value::as_str);
     let label = readable_place_label(
         city.as_deref(),
@@ -3869,6 +3987,7 @@ fn parse_faa_inquiry_fields(html: &str) -> BTreeMap<String, String> {
         .select(&selector)
         .map(|cell| cell.text().collect::<Vec<_>>().join(" "))
         .map(|cell| cell.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|cell| safe_display(&cell))
         .filter(|cell| !cell.is_empty())
         .collect::<Vec<_>>();
 
@@ -3981,8 +4100,8 @@ fn callsign_prefix(callsign: Option<&str>) -> Option<String> {
 fn first_present(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(safe_display)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn readable_place_label(
@@ -3998,7 +4117,7 @@ fn readable_place_label(
         }
     }
     if parts.is_empty() {
-        fallback.map(ToOwned::to_owned)
+        fallback.map(safe_display)
     } else {
         Some(parts.join(", "))
     }
@@ -4213,6 +4332,13 @@ fn string_or_unknown(value: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Strips C0/C1 control characters and Unicode bidi override/embedding/
+/// isolate characters from externally-sourced text before it's displayed.
+/// Aircraft metadata (callsigns, operator names, registrations) comes from
+/// ADS-B broadcasts and crowdsourced databases with no authentication —
+/// anyone can transmit an arbitrary callsign — so a bidi override character
+/// (e.g. U+202E) could otherwise be used to visually reorder displayed text
+/// and mislead whoever's reading the dashboard.
 fn safe_display(value: &str) -> String {
     value
         .chars()
@@ -4222,7 +4348,9 @@ fn safe_display(value: &str) -> String {
                 || code == 0x0b
                 || code == 0x0c
                 || (0x0e..=0x1f).contains(&code)
-                || (0x7f..=0x9f).contains(&code))
+                || (0x7f..=0x9f).contains(&code)
+                || (0x202a..=0x202e).contains(&code)
+                || (0x2066..=0x2069).contains(&code))
         })
         .collect()
 }
@@ -4318,7 +4446,7 @@ fn pushln(report: &mut String, line: &str) {
 
 fn value_string(value: Option<&Value>) -> Option<String> {
     match value? {
-        Value::String(value) => Some(value.clone()),
+        Value::String(value) => Some(safe_display(value)),
         Value::Number(value) => Some(value.to_string()),
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
@@ -4355,8 +4483,8 @@ fn nested_str(root: Option<&Value>, path: &[&str]) -> Option<String> {
     }
     current
         .as_str()
+        .map(safe_display)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn nested_object<'a>(root: Option<&'a Value>, path: &[&str]) -> Option<&'a Map<String, Value>> {
@@ -4371,8 +4499,8 @@ fn object_str(object: Option<&Map<String, Value>>, key: &str) -> Option<String> 
     object?
         .get(key)?
         .as_str()
+        .map(safe_display)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn airline_icao(prefix: &str) -> Option<&'static str> {
@@ -4537,6 +4665,13 @@ mod tests {
     #[test]
     fn safe_display_removes_control_characters() {
         assert_eq!(safe_display("ok\u{1b}[31mred\u{00}"), "ok[31mred");
+    }
+
+    #[test]
+    fn safe_display_removes_bidi_override_characters() {
+        // U+202E (RLO) could otherwise be used by a spoofed callsign or
+        // crowdsourced operator name to visually reorder displayed text.
+        assert_eq!(safe_display("N1\u{202e}TXE\u{202c}23"), "N1TXE23");
     }
 
     #[test]

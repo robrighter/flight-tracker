@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest template for the Microsoft Store submission of Nearest Flight Tracker.
+  {ARCH} is substituted per-architecture (x64 / arm64) by packaging/build-msix.ps1
+  before makeappx packs each variant; the two resulting .msix files are then
+  combined into a single .msixbundle so the Store can serve the right native
+  binary for the user's device.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="RobRighter.NearestFlightTracker"
+    Publisher="CN=231AD612-7448-4A51-A946-11B802E9219B"
+    Version="{VERSION}"
+    ProcessorArchitecture="{ARCH}" />
+
+  <Properties>
+    <DisplayName>Nearest Flight Tracker</DisplayName>
+    <PublisherDisplayName>Rob Righter</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <DeviceCapability Name="location" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="App" Executable="flight-tracker.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Nearest Flight Tracker"
+        Description="Find and track the nearest aircraft to your location using live ADS-B data."
+        BackgroundColor="#0B1620"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+</Package>

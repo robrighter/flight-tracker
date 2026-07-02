@@ -37,6 +37,10 @@ if (-not (Test-Path $Exe)) { throw "built exe not found at $Exe" }
 Write-Host "Binary: $Exe" -ForegroundColor Green
 
 # 2) Ensure WiX v3.14 binaries (candle/light) are available in a cache folder.
+# The zip's SHA256 is pinned so a compromised or tampered download (e.g. a
+# swapped release asset) is caught before we run candle.exe/light.exe from it,
+# rather than silently trusting whatever bytes came back over HTTPS.
+$WixZipSha256 = '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31'
 $WixCache = Join-Path $env:LOCALAPPDATA 'flight-tracker-build\wix314'
 $Candle = Join-Path $WixCache 'candle.exe'
 if (-not (Test-Path $Candle)) {
@@ -45,6 +49,13 @@ if (-not (Test-Path $Candle)) {
     $zip = Join-Path $WixCache 'wix314-binaries.zip'
     $url = 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip'
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+    $actualSha256 = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+    if ($actualSha256 -ne $WixZipSha256) {
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        throw "WiX toolset download failed integrity check: expected SHA256 $WixZipSha256, got $actualSha256. Refusing to extract/run it."
+    }
+
     Expand-Archive -Path $zip -DestinationPath $WixCache -Force
 }
 $Light = Join-Path $WixCache 'light.exe'
