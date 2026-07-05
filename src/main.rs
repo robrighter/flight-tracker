@@ -19,12 +19,14 @@ use std::fmt::{self, Display};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(windows)]
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 #[cfg(windows)]
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 #[cfg(windows)]
 use windows::Devices::Geolocation::{Geolocator, PositionAccuracy};
 #[cfg(windows)]
@@ -105,8 +107,10 @@ const WM_NCUAHDRAWCAPTION: u32 = 0x00AE;
 const WM_NCUAHDRAWFRAME: u32 = 0x00AF;
 #[cfg(windows)]
 const AUTO_REFRESH_TIMER_ID: usize = 1;
-#[cfg(windows)]
-const AUTO_REFRESH_INTERVAL_MS: u32 = 20_000;
+/// Lower bound on the user-configurable refresh interval, to prevent an
+/// accidentally tiny --refresh-seconds value from hammering OpenSky's
+/// per-user daily request quota.
+const MIN_AUTO_REFRESH_INTERVAL_MS: u32 = 10_000;
 #[cfg(windows)]
 const RADAR_ANIMATION_TIMER_ID: usize = 2;
 /// Redraw rate for extrapolated aircraft motion between OpenSky refreshes.
@@ -148,13 +152,42 @@ struct FlightTrackerError(String);
 
 impl Display for FlightTrackerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        // Rate-limit errors carry a machine-parseable "RATE_LIMITED:<secs>:"
+        // prefix (see rate_limit_retry_after below) that shouldn't leak into
+        // user-facing text (CLI stderr, UI status) — show the clean message
+        // after it instead.
+        match self
+            .0
+            .strip_prefix(RATE_LIMIT_ERROR_PREFIX)
+            .and_then(|rest| rest.split_once(':'))
+        {
+            Some((_, message)) => formatter.write_str(message),
+            None => formatter.write_str(&self.0),
+        }
     }
 }
 
 impl std::error::Error for FlightTrackerError {}
 
 type AppResult<T> = Result<T, FlightTrackerError>;
+
+/// Marks a [`FlightTrackerError`] as an HTTP 429 with a "retry after N
+/// seconds" hint, so the auto-refresh loop can back off instead of retrying
+/// on the normal cadence into an endpoint that just rejected us. Encoded into
+/// the plain-string error rather than a new error variant, since
+/// FlightTrackerError is used as a generic string error throughout the file.
+const RATE_LIMIT_ERROR_PREFIX: &str = "RATE_LIMITED:";
+const DEFAULT_RATE_LIMIT_BACKOFF_SECS: u64 = 60;
+
+fn rate_limit_retry_after(error: &FlightTrackerError) -> Option<u64> {
+    error
+        .0
+        .strip_prefix(RATE_LIMIT_ERROR_PREFIX)?
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -201,7 +234,11 @@ struct Cli {
     clear_location: bool,
     #[arg(long, help = "Launch the native desktop dashboard window.")]
     ui: bool,
-    #[arg(long, default_value_t = 60, help = "Desktop UI refresh interval hint.")]
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "Desktop UI auto-refresh interval in seconds (minimum 10)."
+    )]
     refresh_seconds: u64,
     #[arg(long, value_enum, default_value_t = Units::Imperial)]
     units: Units,
@@ -384,9 +421,22 @@ impl UiModel {
     }
 }
 
+/// A cached OpenSky OAuth token, reused until shortly before it expires
+/// instead of authenticating on every single refresh — re-fetching a token
+/// per request doubles OpenSky-domain requests per refresh cycle and makes
+/// hitting rate limits (on either endpoint) more likely.
+struct CachedOpenSkyToken {
+    token: String,
+    expires_at: Instant,
+}
+
 #[derive(Clone)]
 struct ApiClient {
     client: Client,
+    opensky_token: Arc<Mutex<Option<CachedOpenSkyToken>>>,
+    /// Latest `X-Rate-Limit-Remaining` seen from OpenSky, or -1 if unknown
+    /// (no response with that header has arrived yet).
+    opensky_rate_limit_remaining: Arc<AtomicI64>,
 }
 
 impl ApiClient {
@@ -399,7 +449,18 @@ impl ApiClient {
             .map_err(|error| {
                 FlightTrackerError(format!("could not create HTTP client: {error}"))
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            opensky_token: Arc::new(Mutex::new(None)),
+            opensky_rate_limit_remaining: Arc::new(AtomicI64::new(-1)),
+        })
+    }
+
+    /// Most recently observed OpenSky daily-quota remaining count, if any
+    /// response has included the `X-Rate-Limit-Remaining` header yet.
+    fn opensky_rate_limit_remaining(&self) -> Option<u32> {
+        let value = self.opensky_rate_limit_remaining.load(Ordering::Relaxed);
+        u32::try_from(value).ok()
     }
 
     fn opensky_get_json(&self, path: &str, params: Vec<(&str, String)>) -> AppResult<Value> {
@@ -411,7 +472,7 @@ impl ApiClient {
             env::var("OPENSKY_CLIENT_SECRET"),
         ) {
             if !client_id.is_empty() && !client_secret.is_empty() {
-                let token = self.fetch_opensky_token(&client_id, &client_secret)?;
+                let token = self.opensky_token(&client_id, &client_secret)?;
                 request = request.bearer_auth(token);
             }
         }
@@ -419,10 +480,43 @@ impl ApiClient {
         let response = request
             .send()
             .map_err(|error| FlightTrackerError(format!("could not reach {url}: {error}")))?;
+        if let Some(remaining) = response
+            .headers()
+            .get("X-Rate-Limit-Remaining")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<i64>().ok())
+        {
+            self.opensky_rate_limit_remaining
+                .store(remaining, Ordering::Relaxed);
+        }
+        check_opensky_rate_limit(&response)?;
         read_json_response(response, &url)
     }
 
-    fn fetch_opensky_token(&self, client_id: &str, client_secret: &str) -> AppResult<String> {
+    /// Returns a valid cached token if one is still fresh, otherwise
+    /// authenticates and caches the result.
+    fn opensky_token(&self, client_id: &str, client_secret: &str) -> AppResult<String> {
+        if let Ok(cache) = self.opensky_token.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if Instant::now() < cached.expires_at {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+        let (token, expires_in_secs) = self.fetch_opensky_token(client_id, client_secret)?;
+        if let Ok(mut cache) = self.opensky_token.lock() {
+            *cache = Some(CachedOpenSkyToken {
+                token: token.clone(),
+                // Refresh a little early rather than right at expiry.
+                expires_at: Instant::now()
+                    + Duration::from_secs(expires_in_secs.saturating_sub(30).max(30)),
+            });
+        }
+        Ok(token)
+    }
+
+    /// Returns the access token and its `expires_in` seconds.
+    fn fetch_opensky_token(&self, client_id: &str, client_secret: &str) -> AppResult<(String, u64)> {
         let body = [
             ("grant_type", "client_credentials"),
             ("client_id", client_id),
@@ -436,15 +530,54 @@ impl ApiClient {
             .map_err(|error| {
                 FlightTrackerError(format!("could not reach {OPENSKY_TOKEN_URL}: {error}"))
             })?;
+        check_opensky_rate_limit(&response)?;
         let data = read_json_response(response, OPENSKY_TOKEN_URL)?;
-        data.get("access_token")
+        let token = data
+            .get("access_token")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .ok_or_else(|| {
                 FlightTrackerError(
                     "OpenSky authentication did not return an access token".to_string(),
                 )
-            })
+            })?;
+        let expires_in_secs = data
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .unwrap_or(300);
+        Ok((token, expires_in_secs))
+    }
+}
+
+/// OpenSky's anonymous quota is easy to exhaust (every dashboard refresh is a
+/// request). Detect a 429 from either OpenSky endpoint here specifically so
+/// the caller can back off instead of hammering an already-rate-limited
+/// endpoint every refresh tick, which just prolongs the block.
+fn check_opensky_rate_limit(response: &Response) -> AppResult<()> {
+    if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(());
+    }
+    let retry_after_secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF_SECS);
+    Err(FlightTrackerError(format!(
+        "{RATE_LIMIT_ERROR_PREFIX}{retry_after_secs}:OpenSky rate limit exceeded (HTTP 429); backing off {retry_after_secs}s"
+    )))
+}
+
+/// OpenSky grants a fixed number of requests per user per day. Widen the
+/// auto-refresh interval as the remaining daily quota (from the
+/// `X-Rate-Limit-Remaining` response header) drops, so a day's budget is
+/// stretched out instead of being exhausted well before the quota resets.
+fn ratchet_refresh_interval_ms(remaining: u32) -> u32 {
+    match remaining {
+        300..=u32::MAX => 30_000,
+        200..=299 => 40_000,
+        100..=199 => 50_000,
+        _ => 60_000,
     }
 }
 
@@ -470,6 +603,13 @@ struct UiState {
     raw_scroll_lines: usize,
     status: String,
     refreshing: bool,
+    /// Set when OpenSky returns a 429; refreshes are skipped entirely until
+    /// this passes, instead of retrying into an already-rate-limited
+    /// endpoint on the normal cadence.
+    backoff_until: Option<Instant>,
+    /// User-configurable auto-refresh cadence (via --refresh-seconds),
+    /// clamped to MIN_AUTO_REFRESH_INTERVAL_MS.
+    refresh_interval_ms: u32,
 }
 
 impl UiState {
@@ -479,9 +619,14 @@ impl UiState {
         radius_km: f64,
         units: Units,
         aircraft: Vec<NearestAircraft>,
+        refresh_seconds: u64,
     ) -> Self {
         let has_aircraft = !aircraft.is_empty();
         let enriched = vec![false; aircraft.len()];
+        let refresh_interval_ms = refresh_seconds
+            .saturating_mul(1000)
+            .min(u32::MAX as u64)
+            .max(MIN_AUTO_REFRESH_INTERVAL_MS as u64) as u32;
         let mut state = Self {
             client,
             location,
@@ -499,6 +644,8 @@ impl UiState {
                 "WAITING FOR ADS-B".to_string()
             },
             refreshing: false,
+            backoff_until: None,
+            refresh_interval_ms,
         };
         state.rebuild_report();
         state
@@ -689,7 +836,14 @@ fn run(console_attached: bool) -> AppResult<()> {
             }
         }
         let aircraft = Vec::new();
-        let mut state = UiState::new(client, location, args.radius_km, args.units, aircraft);
+        let mut state = UiState::new(
+            client,
+            location,
+            args.radius_km,
+            args.units,
+            aircraft,
+            args.refresh_seconds,
+        );
         if location_failed {
             state.status = "NO LOCATION \u{2014} use --set-location".to_string();
         }
@@ -940,6 +1094,7 @@ fn point_in(rect: RECT, x: i32, y: i32) -> bool {
 
 #[cfg(windows)]
 fn run_dashboard_window(state: UiState) -> AppResult<()> {
+    let refresh_interval_ms = state.refresh_interval_ms;
     if UI_STATE.set(Mutex::new(state)).is_err() {
         return Err(FlightTrackerError(
             "dashboard state was already initialized".to_string(),
@@ -1002,7 +1157,7 @@ fn run_dashboard_window(state: UiState) -> AppResult<()> {
         let timer_id = SetTimer(
             Some(hwnd),
             AUTO_REFRESH_TIMER_ID,
-            AUTO_REFRESH_INTERVAL_MS,
+            refresh_interval_ms,
             None,
         );
         if timer_id == 0 {
@@ -1354,6 +1509,22 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
         if state.refreshing {
             return;
         }
+        // Skip the request entirely while backing off from a prior 429,
+        // rather than retrying into an already-rate-limited endpoint on the
+        // normal cadence (which just prolongs the block and burns more of
+        // the daily quota). Refresh the status each tick so the remaining
+        // wait is still roughly visible.
+        if let Some(until) = state.backoff_until {
+            let now = Instant::now();
+            if now < until {
+                let remaining = (until - now).as_secs();
+                state.status = format!("RATE LIMITED \u{2014} retry in {remaining}s");
+                drop(state);
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                return;
+            }
+            state.backoff_until = None;
+        }
         state.refreshing = true;
         if show_status {
             state.status = "REFRESHING".to_string();
@@ -1411,19 +1582,34 @@ fn refresh_dashboard(hwnd: HWND, show_status: bool) {
                         state.selected = selected_index;
                         state.raw_scroll_lines = 0;
                         state.status = "LIVE ADS-B".to_string();
+                        state.backoff_until = None;
                         state.rebuild_report();
                     }
                     Ok(None) => {
                         state.status = "NO CONTACTS".to_string();
+                        state.backoff_until = None;
                     }
                     Err(error) => {
-                        state.status = format!("REFRESH FAILED: {error}");
+                        if let Some(retry_after) = rate_limit_retry_after(&error) {
+                            state.status =
+                                format!("RATE LIMITED \u{2014} retry in {retry_after}s");
+                            state.backoff_until =
+                                Some(Instant::now() + Duration::from_secs(retry_after.max(5)));
+                        } else {
+                            state.status = format!("REFRESH FAILED: {error}");
+                        }
                     }
                 }
                 state.refreshing = false;
             }
         }
         let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+        // Ratchet the refresh cadence down as the daily OpenSky quota runs
+        // low, once a response has told us how much is left.
+        if let Some(remaining) = client.opensky_rate_limit_remaining() {
+            let interval_ms = ratchet_refresh_interval_ms(remaining);
+            let _ = unsafe { SetTimer(Some(hwnd), AUTO_REFRESH_TIMER_ID, interval_ms, None) };
+        }
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     });
 }
@@ -3064,13 +3250,28 @@ fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Windows `DateTime`/`FILETIME` values count 100ns ticks since 1601-01-01,
+/// while we want to compare against a Unix timestamp; this is the fixed
+/// offset between the two epochs, in the same 100ns units.
+#[cfg(windows)]
+const FILETIME_UNIX_EPOCH_DIFFERENCE_100NS: i64 = 116_444_736_000_000_000;
+
+/// The Windows Location API's `maximumAge` parameter is only a hint: on
+/// desktops without GPS it can still hand back a Wi-Fi/IP-based fix that was
+/// cached from before the machine moved networks. Reject anything older than
+/// this so a stale fix surfaces as a location error (with its usual
+/// fallback/message) instead of silently showing aircraft around the wrong
+/// place.
+#[cfg(windows)]
+const MAX_ACCEPTABLE_FIX_AGE_SECONDS: f64 = 300.0;
+
 #[cfg(windows)]
 fn resolve_windows_location(timeout_seconds: f64) -> AppResult<Location> {
     let locator = Geolocator::new().map_err(|error| {
         FlightTrackerError(format!("could not create Windows geolocator: {error}"))
     })?;
     locator
-        .SetDesiredAccuracy(PositionAccuracy::Default)
+        .SetDesiredAccuracy(PositionAccuracy::High)
         .map_err(|error| {
             FlightTrackerError(format!("could not configure Windows geolocator: {error}"))
         })?;
@@ -3096,6 +3297,18 @@ fn resolve_windows_location(timeout_seconds: f64) -> AppResult<Location> {
     let position = point.Position().map_err(|error| {
         FlightTrackerError(format!("Windows location had no position: {error}"))
     })?;
+
+    if let Ok(timestamp) = coordinate.Timestamp() {
+        let fix_unix_seconds =
+            (timestamp.UniversalTime - FILETIME_UNIX_EPOCH_DIFFERENCE_100NS) as f64 / 10_000_000.0;
+        let age_seconds = Utc::now().timestamp() as f64 - fix_unix_seconds;
+        if age_seconds > MAX_ACCEPTABLE_FIX_AGE_SECONDS {
+            return Err(FlightTrackerError(format!(
+                "Windows Location API returned a stale fix ({:.0} minutes old); the PC likely hasn't rescanned its surroundings since it last moved. Enable Location Services/Wi-Fi scanning, or save a fallback with: flight-tracker --set-location --lat <latitude> --lon <longitude> --location-label \"Home\"",
+                age_seconds / 60.0
+            )));
+        }
+    }
 
     validate_lat_lon(position.Latitude, position.Longitude)?;
     Ok(Location {
@@ -4672,6 +4885,45 @@ mod tests {
         // U+202E (RLO) could otherwise be used by a spoofed callsign or
         // crowdsourced operator name to visually reorder displayed text.
         assert_eq!(safe_display("N1\u{202e}TXE\u{202c}23"), "N1TXE23");
+    }
+
+    #[test]
+    fn rate_limit_error_parses_retry_after() {
+        let error = FlightTrackerError(format!(
+            "{RATE_LIMIT_ERROR_PREFIX}42:OpenSky rate limit exceeded (HTTP 429); backing off 42s"
+        ));
+        assert_eq!(rate_limit_retry_after(&error), Some(42));
+    }
+
+    #[test]
+    fn rate_limit_error_display_hides_the_machine_prefix() {
+        let error = FlightTrackerError(format!(
+            "{RATE_LIMIT_ERROR_PREFIX}42:OpenSky rate limit exceeded (HTTP 429); backing off 42s"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "OpenSky rate limit exceeded (HTTP 429); backing off 42s"
+        );
+    }
+
+    #[test]
+    fn non_rate_limit_error_has_no_retry_after() {
+        let error = FlightTrackerError("could not reach opensky-network.org".to_string());
+        assert_eq!(rate_limit_retry_after(&error), None);
+        assert_eq!(error.to_string(), "could not reach opensky-network.org");
+    }
+
+    #[test]
+    fn ratchet_refresh_interval_widens_as_quota_drops() {
+        assert_eq!(ratchet_refresh_interval_ms(400), 30_000);
+        assert_eq!(ratchet_refresh_interval_ms(300), 30_000);
+        assert_eq!(ratchet_refresh_interval_ms(299), 40_000);
+        assert_eq!(ratchet_refresh_interval_ms(200), 40_000);
+        assert_eq!(ratchet_refresh_interval_ms(199), 50_000);
+        assert_eq!(ratchet_refresh_interval_ms(100), 50_000);
+        assert_eq!(ratchet_refresh_interval_ms(99), 60_000);
+        assert_eq!(ratchet_refresh_interval_ms(1), 60_000);
+        assert_eq!(ratchet_refresh_interval_ms(0), 60_000);
     }
 
     #[test]

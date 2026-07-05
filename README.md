@@ -129,6 +129,14 @@ The window works with the same location options as the CLI, e.g. explicit coordi
 
 Only the selected aircraft is enriched with route/registry/operator detail on each refresh (to respect upstream rate limits); selecting another row enriches it on demand.
 
+The dashboard auto-refreshes every 30 seconds by default. Override it with `--refresh-seconds` (minimum 10):
+
+```powershell
+.\target\release\flight-tracker.exe --ui --refresh-seconds 60
+```
+
+OpenSky's free tier grants roughly 400 requests/day per user, so lower intervals will exhaust that quota faster if the dashboard runs continuously. The app also widens the refresh interval automatically as the daily quota runs low (based on OpenSky's `X-Rate-Limit-Remaining` response header): 30s above 300 remaining, 40s from 200-299, 50s from 100-199, and 60s below 100. It backs off entirely if OpenSky returns a rate-limit response.
+
 ## OpenSky Credentials
 
 Anonymous OpenSky access can be rate limited. To use OpenSky OAuth credentials:
